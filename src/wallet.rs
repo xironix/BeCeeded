@@ -5,12 +5,11 @@
 
 use crate::memory::SecureBytes;
 use crate::mnemonic::{Mnemonic, MnemonicError};
-use ring::digest::{Context, SHA256, SHA512};
+use ring::digest::{Context, SHA256};
 use ring::hmac::{HMAC_SHA512, Key, sign};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
-use zeroize::ZeroizeOnDrop;
 
 /// Error types for wallet operations
 #[derive(Debug, Error)]
@@ -51,7 +50,7 @@ impl Network {
 }
 
 /// A cryptocurrency wallet
-#[derive(Clone, ZeroizeOnDrop)]
+#[derive(Clone)]
 pub struct Wallet {
     /// The network this wallet is for
     network: Network,
@@ -336,7 +335,7 @@ mod tests {
             .expect("Failed to create wallet");
         
         let message = b"Test message";
-        let signature = wallet.sign_message(message);
+        let _signature = wallet.sign_message(message);
         
         // Note: This test will fail with the placeholder implementation
         // A real implementation would use proper signature verification

@@ -9,6 +9,7 @@ use beceeded::{
     wallet::{Network, Wallet},
 };
 use clap::{Parser as ClapParser, Subcommand};
+use clap::builder::TypedValueParser;
 use log::LevelFilter;
 use std::path::PathBuf;
 

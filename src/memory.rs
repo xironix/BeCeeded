@@ -68,7 +68,7 @@ pub fn secure_string(s: impl Into<String>) -> SecureString {
 
 /// Create a new secure bytes container
 pub fn secure_bytes(bytes: Vec<u8>) -> SecretBox<Vec<u8>> {
-    bytes.into()
+    SecretBox::new(Box::new(bytes))
 }
 
 #[cfg(test)]
