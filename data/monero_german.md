@@ -1,5 +1,5 @@
 | Index | Word           |
-|||
+|-------|----------------|
 | 1     | Abakus                        
 | 2     | Abart                        
 | 3     | abbilden                        

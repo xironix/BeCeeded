@@ -1,5 +1,5 @@
 | Index | Word            |
-|||
+|-------|-----------------|
 | 1     | abako                        
 | 2     | abdiki                        
 | 3     | abelo                        

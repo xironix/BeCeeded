@@ -1,5 +1,5 @@
 | Index | Word         |
-|||
+|-------|--------------|
 | 1     | ábaco                        
 | 2     | abdomen                        
 | 3     | abeja                        

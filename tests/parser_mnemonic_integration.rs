@@ -53,11 +53,13 @@ fn test_different_wordlists() {
     let languages = ["english", "spanish", "french", "italian", "japanese", "korean"];
     
     for language in languages.iter() {
-        let mut config = ParserConfig::default();
-        config.wordlist_name = language.to_string();
+        let config = ParserConfig {
+            wordlist_name: language.to_string(),
+            ..ParserConfig::default()
+        };
         
         // Create parser with the selected language
-        let parser = match Parser::new(config) {
+        let parser = match Parser::new(std::path::PathBuf::from("data"), language.to_string(), config) {
             Ok(p) => p,
             Err(_) => {
                 println!("Skipping test for {}: wordlist not available", language);
@@ -153,4 +155,221 @@ fn test_secure_string_handling() {
     
     // They should be different
     assert_ne!(seed_with_pass.as_bytes(), seed_without_pass.as_bytes());
+}
+
+#[test]
+fn test_comprehensive_wordlists_and_lengths() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::HashSet;
+    
+    // All available wordlists - both standard BIP-39 and Monero variants
+    let all_wordlists = [
+        // Standard BIP-39 wordlists
+        "chinese_simplified", "chinese_traditional", "czech", "english", 
+        "french", "italian", "japanese", "korean", "portuguese", "spanish",
+        
+        // Monero-specific wordlists
+        "monero_chinese_simplified", "monero_dutch", "monero_english", 
+        "monero_esperanto", "monero_french", "monero_german", "monero_italian", 
+        "monero_japanese", "monero_lojban", "monero_portuguese", 
+        "monero_russian", "monero_spanish"
+    ];
+    
+    // Different mnemonic lengths to test
+    let standard_lengths = [12, 15, 18, 21, 24];
+    let monero_lengths = [25]; // Monero uses 25-word mnemonics
+    
+    // Basic seed for our random number generation
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH)
+        .unwrap_or_default().as_millis() as u64;
+    
+    println!("Testing with random seed: {}", seed);
+    
+    // Test each wordlist
+    for language in all_wordlists.iter() {
+        println!("\nTesting wordlist: {}", language);
+        
+        // Determine if this is a Monero wordlist
+        let is_monero = language.starts_with("monero_");
+        
+        // Choose appropriate lengths based on wordlist type
+        let lengths_to_test = if is_monero {
+            &monero_lengths[..]
+        } else {
+            &standard_lengths[..]
+        };
+        
+        // Create parser config for this language
+        let config = ParserConfig {
+            validate_checksum: false, // Initially disable checksum for testing flexibility
+            valid_word_counts: if is_monero {
+                vec![25] // Monero only uses 25-word phrases
+            } else {
+                standard_lengths.to_vec() // BIP-39 uses various lengths
+            },
+            wordlist_name: language.to_string(),
+            ..ParserConfig::default()
+        };
+        
+        // Try to load the wordlist
+        let parser = match Parser::new(std::path::PathBuf::from("data"), language.to_string(), config) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  Skipping {}: Unable to load wordlist: {:?}", language, e);
+                continue;
+            }
+        };
+        
+        // Report wordlist size
+        let wordlist_size = parser.wordlist_len();
+        println!("  Loaded {} with {} words", language, wordlist_size);
+        
+        // For each mnemonic length
+        for &length in lengths_to_test {
+            // Skip if wordlist is too small
+            if wordlist_size < length {
+                println!("  Skipping {}-word test: wordlist too small", length);
+                continue;
+            }
+            
+            println!("  Testing {}-word mnemonic", length);
+            
+            // Generate truly random indices using our seed
+            let mut rng = seed;
+            let mut used_indices = HashSet::new();
+            let mut random_indices = Vec::with_capacity(length);
+            
+            // Select 'length' unique random words from the wordlist
+            while random_indices.len() < length {
+                // Simple xorshift random number generation
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                
+                // Get a random index within the wordlist range
+                let idx = (rng % wordlist_size as u64) as usize;
+                
+                // Only use each word once in our test
+                if !used_indices.contains(&idx) {
+                    used_indices.insert(idx);
+                    random_indices.push(idx);
+                }
+            }
+            
+            // For Monero 25-word mnemonics, the last word should be a valid checksum
+            // But since we're testing with random words, we need to adjust the last word
+            if is_monero && length == 25 {
+                // For our test, we'll simply make the checksum word valid by calculation
+                // This is a simplification for testing - we're just ensuring the parser accepts it
+                // Replace the 25th word with a valid one if needed
+                random_indices.pop(); // Remove the last word
+                
+                // Generate a valid checksum word index based on first 24 words
+                let mut total: u128 = 0;
+                let mut power: u128 = 1;
+                let base = wordlist_size as u128;
+                
+                for i in 0..24 {
+                    let idx = random_indices[i] as u128;
+                    total = total.wrapping_add(idx.wrapping_mul(power));
+                    power = power.wrapping_mul(base);
+                    
+                    if power >= u128::MAX / base {
+                        power %= base;
+                        total %= base;
+                    }
+                }
+                
+                let checksum_idx = (total % base) as usize;
+                random_indices.push(checksum_idx);
+                println!("    Generated valid checksum word at index {}", checksum_idx);
+            }
+            
+            // Get the words at these random indices
+            let random_words: Vec<String> = random_indices.iter()
+                .map(|&idx| parser.get_wordlist_slice(idx, idx + 1)[0].clone())
+                .collect();
+            
+            // Check if this is a CJK wordlist for display purposes
+            let is_cjk = language.contains("chinese") || 
+                        language.contains("japanese") || 
+                        language.contains("korean");
+                
+            // Join into a mnemonic phrase with proper separator
+            let test_phrase = if is_cjk {
+                // For CJK languages, join without spaces for testing
+                random_words.join("")
+            } else {
+                // For all other languages, separate with spaces
+                random_words.join(" ")
+            };
+            
+            // Create a new parser with checksum validation enabled for final test
+            let config_with_checksum = ParserConfig {
+                validate_checksum: true,
+                valid_word_counts: if is_monero {
+                    vec![25]
+                } else {
+                    standard_lengths.to_vec()
+                },
+                wordlist_name: language.to_string(),
+                ..ParserConfig::default()
+            };
+            
+            let parser_with_checksum = match Parser::new(
+                std::path::PathBuf::from("data"), 
+                language.to_string(), 
+                config_with_checksum
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("  Skipping checksum validation: Unable to create parser: {:?}", e);
+                    continue;
+                }
+            };
+            
+            // For non-Monero mnemonics, we need to disable checksum validation
+            // because our random words won't have valid checksums
+            let parser_to_use = if is_monero {
+                // For Monero we constructed a valid checksum, so use the parser with validation
+                parser_with_checksum
+            } else {
+                // For other wordlists, continue using the parser without checksum validation
+                parser.clone()
+            };
+            
+            // Test parsing the random mnemonic
+            let parsed_result = parser_to_use.parse(&test_phrase);
+            
+            // Verify the result
+            if let Err(ref e) = parsed_result {
+                println!("    Error parsing {}-word {} mnemonic: {:?}", length, language, e);
+                
+                // Debug information
+                println!("    Test phrase format: {}", if is_cjk { "no spaces" } else { "space-separated" });
+                println!("    First 3 words: {:?}", &random_words[0..3.min(random_words.len())]);
+                
+                if is_monero {
+                    println!("    First 5 word indices: {:?}", &random_indices[0..5.min(random_indices.len())]);
+                }
+            }
+            
+            assert!(parsed_result.is_ok(), 
+                    "Failed to parse {}-word {} mnemonic", length, language);
+            
+            let words = parsed_result.unwrap();
+            assert_eq!(words.len(), length, 
+                      "Parsed {} mnemonic has wrong word count", language);
+            
+            // Verify each word matched what we expected
+            for (i, word) in words.iter().enumerate() {
+                assert_eq!(word, &random_words[i], 
+                          "Word mismatch at position {} in {} mnemonic", i, language);
+            }
+            
+            println!("    ✓ Successfully parsed random {}-word mnemonic", length);
+        }
+    }
+    
+    println!("\nAll wordlist and length combinations tested successfully!");
 } 

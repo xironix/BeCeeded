@@ -1,5 +1,5 @@
 | Index | Word              |
-|||
+|-------|-------------------|
 | 1     | aalglad                        
 | 2     | aalscholver                        
 | 3     | aambeeld                        

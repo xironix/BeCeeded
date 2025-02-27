@@ -1,5 +1,5 @@
 | Index | Word         |
-|||
+|-------|--------------|
 | 1     | abandon                        
 | 2     | abattre                        
 | 3     | aboi                        

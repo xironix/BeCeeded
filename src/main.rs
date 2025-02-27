@@ -83,13 +83,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create parser config
     let config = ParserConfig {
-        wordlist_dir: cli.wordlist_dir,
+        // Core config parameters
+        validate_checksum: true,
+        max_words: 24,
+        valid_word_counts: vec![12, 15, 18, 21, 24],
         wordlist_name: cli.wordlist.clone(),
-        ..ParserConfig::default()
     };
 
     // Create parser
-    let parser = Parser::new(config)?;
+    let parser = Parser::new(cli.wordlist_dir, cli.wordlist.clone(), config)?;
 
     // Execute subcommand
     match &cli.command {

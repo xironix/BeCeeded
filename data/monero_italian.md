@@ -1,5 +1,5 @@
 | Index | Word         |
-|||
+|-------|--------------|
 | 1     | abbinare                        
 | 2     | abbonato                        
 | 3     | abisso                        

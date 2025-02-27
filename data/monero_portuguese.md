@@ -1,5 +1,5 @@
 | Index | Word             |
-|||
+|-------|------------------|
 | 1     | abaular                        
 | 2     | abdominal                        
 | 3     | abeto                        

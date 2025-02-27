@@ -1,5 +1,5 @@
 | Index | Word         |
-|||
+|-------|--------------|
 | 1     | abbey                           
 | 2     | abducts                         
 | 3     | ability                         

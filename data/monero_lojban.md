@@ -1,5 +1,5 @@
 | Index | Word         |
-|||
+|-------|--------------|
 | 1     | backi                        
 | 2     | bacru                        
 | 3     | badna                        
