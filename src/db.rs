@@ -64,7 +64,7 @@ impl SqliteDbController {
         })?;
         
         // Create controller
-        let mut controller = Self {
+        let controller = Self {
             conn: Mutex::new(conn),
             db_path: if in_memory { None } else { Some(PathBuf::from(db_path)) },
             in_memory,
@@ -91,9 +91,9 @@ impl SqliteDbController {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let conn = self.conn.lock().unwrap();
+        let mut conn_guard = self.conn.lock().unwrap();
         
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| {
+        let tx = conn_guard.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| {
             error!("Failed to begin transaction: {}", e);
             ScannerError::DatabaseError(format!("Failed to begin transaction: {}", e))
         })?;
@@ -119,10 +119,10 @@ impl DbController for SqliteDbController {
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS phrases (
                     id INTEGER PRIMARY KEY,
-                    phrase TEXT NOT NULL UNIQUE,
+                    phrase TEXT NOT NULL,
                     file_path TEXT NOT NULL,
                     line_number INTEGER,
-                    fuzzy_matched INTEGER NOT NULL,
+                    fuzzy_matched INTEGER NOT NULL DEFAULT 0,
                     confidence REAL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )",
@@ -191,66 +191,70 @@ impl DbController for SqliteDbController {
     }
     
     fn insert_phrase(&self, phrase: &FoundPhrase) -> Result<bool> {
-        // Insert the phrase and return true if it was new, false if it already existed
-        self.transaction(|conn| {
-            // Check if the phrase already exists
-            let mut stmt = conn.prepare("SELECT id FROM phrases WHERE phrase = ?").map_err(|e| {
-                error!("Failed to prepare statement: {}", e);
-                ScannerError::DatabaseError(format!("Failed to prepare statement: {}", e))
+        debug!("Inserting phrase into database: {}", phrase.phrase);
+        
+        let mut conn = self.conn.lock().unwrap();
+        
+        // Start a transaction
+        let tx = conn.transaction().map_err(|e| {
+            error!("Failed to start transaction: {}", e);
+            ScannerError::DatabaseError(format!("Failed to start transaction: {}", e))
+        })?;
+        
+        // Check if the phrase already exists
+        let exists: bool = tx.query_row(
+            "SELECT 1 FROM phrases WHERE phrase = ?1",
+            [&phrase.phrase],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        
+        if exists {
+            debug!("Phrase already exists in database");
+            tx.commit().map_err(|e| {
+                error!("Failed to commit transaction: {}", e);
+                ScannerError::DatabaseError(format!("Failed to commit transaction: {}", e))
             })?;
-            
-            let rows = stmt.query_map([&phrase.phrase], |row| row.get::<_, i64>(0)).map_err(|e| {
-                error!("Failed to query phrases: {}", e);
-                ScannerError::DatabaseError(format!("Failed to query phrases: {}", e))
-            })?;
-            
-            let existing_ids: Vec<i64> = rows.filter_map(Result::ok).collect();
-            
-            if !existing_ids.is_empty() {
-                // Phrase already exists
-                debug!("Phrase already exists in database");
-                return Ok(false);
-            }
-            
-            // Insert the phrase
-            let line_number_value = match phrase.line_number {
-                Some(line) => line as i64,
-                None => -1, // Use -1 to represent null
-            };
-            
-            let confidence_value = phrase.confidence.unwrap_or(0.0);
-            
-            conn.execute(
-                "INSERT INTO phrases (phrase, file_path, line_number, fuzzy_matched, confidence)
-                 VALUES (?, ?, ?, ?, ?)",
-                params![
-                    &phrase.phrase,
-                    &phrase.file_path,
-                    line_number_value,
-                    phrase.fuzzy_matched as i64,
-                    confidence_value,
-                ],
+            return Ok(false);
+        }
+        
+        // Insert the phrase
+        let fuzzy_matched_value = if phrase.fuzzy_matched { 1 } else { 0 };
+        let confidence_value = phrase.confidence.unwrap_or(0.0);
+        
+        tx.execute(
+            "INSERT INTO phrases (phrase, file_path, line_number, fuzzy_matched, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                phrase.phrase,
+                phrase.file_path,
+                phrase.line_number.map(|n| n as i64),
+                fuzzy_matched_value,
+                confidence_value,
+            ],
+        ).map_err(|e| {
+            error!("Failed to insert phrase: {}", e);
+            ScannerError::DatabaseError(format!("Failed to insert phrase: {}", e))
+        })?;
+        
+        let phrase_id = tx.last_insert_rowid();
+        
+        // Insert wallet addresses
+        for address in &phrase.wallet_addresses {
+            tx.execute(
+                "INSERT INTO wallet_addresses (phrase_id, address) VALUES (?, ?)",
+                params![phrase_id, address],
             ).map_err(|e| {
-                error!("Failed to insert phrase: {}", e);
-                ScannerError::DatabaseError(format!("Failed to insert phrase: {}", e))
+                error!("Failed to insert wallet address: {}", e);
+                ScannerError::DatabaseError(format!("Failed to insert wallet address: {}", e))
             })?;
-            
-            let phrase_id = conn.last_insert_rowid();
-            
-            // Insert wallet addresses
-            for address in &phrase.wallet_addresses {
-                conn.execute(
-                    "INSERT INTO wallet_addresses (phrase_id, address) VALUES (?, ?)",
-                    params![phrase_id, address],
-                ).map_err(|e| {
-                    error!("Failed to insert wallet address: {}", e);
-                    ScannerError::DatabaseError(format!("Failed to insert wallet address: {}", e))
-                })?;
-            }
-            
-            debug!("Inserted new phrase into database");
-            Ok(true)
-        })
+        }
+        
+        debug!("Inserted new phrase into database");
+        tx.commit().map_err(|e| {
+            error!("Failed to commit transaction: {}", e);
+            ScannerError::DatabaseError(format!("Failed to commit transaction: {}", e))
+        })?;
+        Ok(true)
     }
     
     fn insert_eth_key(&self, key: &FoundEthKey) -> Result<bool> {
@@ -267,7 +271,7 @@ impl DbController for SqliteDbController {
                 ScannerError::DatabaseError(format!("Failed to query ethereum_keys: {}", e))
             })?;
             
-            let existing_ids: Vec<i64> = rows.filter_map(Result::ok).collect();
+            let existing_ids: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
             
             if !existing_ids.is_empty() {
                 // Key already exists
@@ -303,7 +307,7 @@ impl DbController for SqliteDbController {
     fn get_all_phrases(&self) -> Result<Vec<FoundPhrase>> {
         debug!("Fetching all phrases from database");
         
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         
         // Prepare the query
         let mut stmt = conn.prepare(
@@ -320,9 +324,9 @@ impl DbController for SqliteDbController {
             let id: i64 = row.get(0)?;
             let phrase: String = row.get(1)?;
             let file_path: String = row.get(2)?;
-            let line_number: i64 = row.get(3)?;
-            let fuzzy_matched: i64 = row.get(4)?;
-            let confidence: f32 = row.get(5)?;
+            let line_number: i32 = row.get(3)?;
+            let fuzzy_matched: i32 = row.get(4)?;
+            let confidence: f64 = row.get(5)?;
             
             Ok((id, phrase, file_path, line_number, fuzzy_matched != 0, confidence))
         }).map_err(|e| {
@@ -330,7 +334,7 @@ impl DbController for SqliteDbController {
             ScannerError::DatabaseError(format!("Failed to query phrases: {}", e))
         })?;
         
-        let mut phrase_data: Vec<(i64, String, String, i64, bool, f32)> = phrase_rows.filter_map(Result::ok).collect();
+        let phrase_data: Vec<(i64, String, String, i32, bool, f64)> = phrase_rows.filter_map(|r| r.ok()).collect();
         
         // Get wallet addresses for each phrase
         let mut result = Vec::new();
@@ -352,7 +356,7 @@ impl DbController for SqliteDbController {
                 ScannerError::DatabaseError(format!("Failed to query wallet addresses: {}", e))
             })?;
             
-            let wallet_addresses: Vec<String> = address_rows.filter_map(Result::ok).collect();
+            let wallet_addresses: Vec<String> = address_rows.filter_map(|r| r.ok()).collect();
             
             // Create the FoundPhrase
             let line_number = if line_number >= 0 {
@@ -384,7 +388,7 @@ impl DbController for SqliteDbController {
     fn get_all_eth_keys(&self) -> Result<Vec<FoundEthKey>> {
         debug!("Fetching all Ethereum keys from database");
         
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         
         // Prepare the query
         let mut stmt = conn.prepare(
@@ -420,7 +424,7 @@ impl DbController for SqliteDbController {
             ScannerError::DatabaseError(format!("Failed to query Ethereum keys: {}", e))
         })?;
         
-        let result: Vec<FoundEthKey> = key_rows.filter_map(Result::ok).collect();
+        let result: Vec<FoundEthKey> = key_rows.filter_map(|r| r.ok()).collect();
         
         debug!("Fetched {} Ethereum keys from database", result.len());
         Ok(result)

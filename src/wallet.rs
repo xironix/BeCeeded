@@ -12,6 +12,7 @@ use std::fmt;
 use thiserror::Error;
 use bs58;
 use ripemd;
+use ripemd::Digest;
 use tiny_keccak;
 
 /// Error types for wallet operations

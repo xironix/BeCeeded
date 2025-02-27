@@ -329,7 +329,7 @@ impl Parser {
         } else {
             // Otherwise, we need to match each word from the wordlist
             let mut matched_words = Vec::new();
-            let mut remaining = input.as_str();
+            let mut remaining = input.to_string();
             
             // Process until we've matched all words or can't match anymore
             while !remaining.is_empty() {
@@ -339,7 +339,7 @@ impl Parser {
                 for word in &self.wordlist {
                     if remaining.starts_with(word) {
                         matched_words.push(word.clone());
-                        remaining = &remaining[word.len()..];
+                        remaining = remaining[word.len()..].to_string();
                         matched = true;
                         break;
                     }
@@ -487,6 +487,12 @@ impl Parser {
     #[inline]
     pub fn wordlist_len(&self) -> usize {
         self.wordlist.len()
+    }
+    
+    /// Get a reference to the full wordlist
+    #[inline]
+    pub fn wordlist(&self) -> &[String] {
+        &self.wordlist
     }
     
     /// Validate the checksum of a Monero mnemonic

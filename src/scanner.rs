@@ -128,7 +128,7 @@ pub struct ScannerConfig {
     pub min_bip39_words: usize,
 
     /// Threshold for fuzzy matching (0.0-1.0, where 1.0 is exact match)
-    pub fuzzy_threshold: f32,
+    pub fuzzy_threshold: f64,
 
     /// Whether to write detailed logs
     pub write_logs: bool,
@@ -260,7 +260,7 @@ impl ScannerConfig {
 }
 
 /// Statistics for scanning operations
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScanStats {
     /// Number of files processed
     pub files_processed: AtomicU64,
@@ -289,7 +289,12 @@ impl ScanStats {
     pub fn new() -> Self {
         Self {
             start_time: Instant::now(),
-            ..Default::default()
+            files_processed: AtomicU64::new(0),
+            dirs_processed: AtomicU64::new(0),
+            bytes_processed: AtomicU64::new(0),
+            phrases_found: AtomicU64::new(0),
+            eth_keys_found: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
         }
     }
 
@@ -311,7 +316,7 @@ impl ScanStats {
 }
 
 /// Found seed phrase information
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FoundPhrase {
     /// The seed phrase
     pub phrase: String,
@@ -329,7 +334,7 @@ pub struct FoundPhrase {
     pub fuzzy_matched: bool,
 
     /// Confidence level for fuzzy matches (0.0-1.0)
-    pub confidence: Option<f32>,
+    pub confidence: Option<f64>,
 }
 
 /// Found Ethereum private key information
@@ -876,7 +881,7 @@ impl Scanner {
         }
         
         // Calculate average similarity
-        let avg_similarity = total_similarity / words.len() as f32;
+        let avg_similarity = total_similarity / words.len() as f64;
         
         // If we have enough valid words and the average similarity is high enough,
         // consider this a potential seed phrase
@@ -924,7 +929,7 @@ impl Scanner {
     }
     
     /// Find the closest BIP-39 word to a given word
-    fn find_closest_bip39_word(&self, word: &str) -> (String, f32) {
+    fn find_closest_bip39_word(&self, word: &str) -> (String, f64) {
         use strsim::jaro_winkler;
         
         let wordlist = self.parser.wordlist();
@@ -1769,7 +1774,7 @@ mod tests {
         fs::write(&image_path, b"Mock image data").unwrap();
         
         // Create a simple mock PDF
-        let pdf_content = "This PDF contains a seed phrase: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let pdf_content = "This is a test document containing a seed phrase: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let pdf_path = create_test_pdf(dir.path(), "seed_phrase.pdf", pdf_content);
         
         // Create a ZIP with a text file inside

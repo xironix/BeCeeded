@@ -13,15 +13,13 @@
  */
 
 use crate::memory::{SecureBytes, SecureString};
-use crate::parser::{Parser, ParserError};
+use crate::parser::{Parser, ParserError, ParserConfig};
 use ring::digest::{Context, SHA256};
-use ring::hmac::{HMAC_SHA512, Key, sign};
+use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
-use secrecy::{ExposeSecret, Secret};
 use std::fmt;
+use std::path::PathBuf;
 use thiserror::Error;
-#[cfg(test)]
-use secrecy::ExposeSecret;
 
 /// Errors related to mnemonic operations
 #[derive(Debug, Error)]
@@ -224,17 +222,24 @@ impl Mnemonic {
     /// Verify the checksum of the mnemonic
     #[inline]
     pub fn verify_checksum(&self) -> Result<bool, MnemonicError> {
-        // Create a parser with checksum validation enabled
-        let mut config = self.parser.config().clone();
-        config.validate_checksum = true;
+        // Create a new parser with the same parameters to handle checksum validation
+        let config = ParserConfig {
+            validate_checksum: true,
+            valid_word_counts: vec![12, 15, 18, 21, 24, 25], // Standard BIP-39 lengths plus Monero
+            wordlist_name: self.parser.wordlist_name().to_string(),
+            max_words: 25, // Allow up to 25 words (Monero)
+        };
+
+        // Create a new parser that will validate the checksum
+        let parser = Parser::new(
+            PathBuf::from("data"), // Use the default wordlist directory
+            self.parser.wordlist_name().to_string(), 
+            config
+        )?;
         
-        let parser_with_checksum = Parser::with_provider(
-            self.parser.provider(),
-            config,
-        ).map_err(MnemonicError::ParserError)?;
-        
-        // Try to parse the mnemonic with checksum validation
-        match parser_with_checksum.parse(&self.to_phrase()) {
+        // Now attempt to parse the phrase with the checksum-validating parser
+        let phrase = self.to_phrase();
+        match parser.parse(&phrase) {
             Ok(_) => Ok(true),
             Err(ParserError::ChecksumError) | Err(ParserError::MoneroChecksumError) => Ok(false),
             Err(e) => Err(MnemonicError::ParserError(e)),
@@ -245,7 +250,7 @@ impl Mnemonic {
     /// 
     /// This is a performance-critical function as it's used in wallet derivation paths
     #[inline]
-    pub fn to_seed(&self, passphrase: Option<&str>) -> Secret<Vec<u8>> {
+    pub fn to_seed(&self, passphrase: Option<&str>) -> crate::memory::SecureBytes {
         // Prepare the mnemonic input
         let mnemonic = self.to_phrase();
         
@@ -255,21 +260,20 @@ impl Mnemonic {
         // Use PBKDF2 to derive the seed
         // Parameters from BIP-39: HMAC-SHA512, 2048 iterations
         const PBKDF2_ITERATIONS: u32 = 2048;
-        const PBKDF2_DIGEST: hmac::Algorithm = hmac::HMAC_SHA512;
         
         // Pre-allocate output buffer (64 bytes for SHA-512)
         let mut seed = vec![0u8; 64];
         
         // Use PBKDF2 from ring crate
         pbkdf2::derive(
-            PBKDF2_DIGEST,
+            pbkdf2::PBKDF2_HMAC_SHA512,
             std::num::NonZeroU32::new(PBKDF2_ITERATIONS).unwrap(),
             salt.as_bytes(),
             mnemonic.as_bytes(),
             &mut seed,
         );
         
-        Secret::new(seed)
+        crate::memory::SecureBytes::new(seed)
     }
 }
 
@@ -301,9 +305,6 @@ impl fmt::Display for Mnemonic {
         write!(f, "[{}]", masked_words.join(" "))
     }
 }
-
-/// Reexport the PBKDF2 implementation for seed generation 
-pub use pbkdf2;
 
 /// Module with benchmarking instructions
 #[cfg(feature = "criterion")]

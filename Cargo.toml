@@ -1,7 +1,7 @@
 [package]
 name = "beceeded"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["I.A. Intelligent", "Steffen L. Norgren"]
 description = "A Rust implementation of ceed_parser, A high-performance tool for parsing and validating cryptocurrency seed phrases, mnemonics, and wallets."
 readme = "README.md"
@@ -22,7 +22,7 @@ unicode-normalization = "0.1.23"  # Unicode normalization (NFKD for mnemonic phr
 
 # Cryptocurrency support
 secp256k1 = { version = "0.30.0", features = ["rand"] } # Bitcoin key operations
-tiny-keccak = { version = "2.0.2", features = ["sha3"] } # Ethereum hashing
+tiny-keccak = { version = "2.0.2", features = ["sha3", "keccak"] } # Ethereum hashing
 bs58 = "0.5.0"                  # Base58 encoding for Bitcoin addresses
 ripemd = "0.1.3"               # RIPEMD160 hashing for Bitcoin addresses
 
@@ -99,3 +99,5 @@ pdf_support = ["dep:pdf"]
 archive = ["dep:zip"]
 # Enable database encryption
 encrypted_db = []
+# Add criterion as an optional dependency
+criterion = []
