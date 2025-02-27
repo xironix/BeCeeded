@@ -533,6 +533,12 @@ impl Parser {
         
         Ok(())
     }
+    
+    /// Check if a word is a valid word in the loaded wordlist
+    #[inline]
+    pub fn is_valid_word(&self, word: &str) -> bool {
+        self.word_indices.contains_key(&word.to_lowercase())
+    }
 }
 
 // Add a module with benchmarking instructions

@@ -120,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Determine the network
             let network = match network.to_lowercase().as_str() {
                 "bitcoin" => Network::Bitcoin,
-                "testnet" => Network::BitcoinTestnet,
                 "ethereum" => Network::Ethereum,
                 _ => {
                     return Err(format!("Unsupported network: {}", network).into());

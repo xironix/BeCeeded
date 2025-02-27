@@ -10,6 +10,9 @@ use ring::hmac::{HMAC_SHA512, Key, sign};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
+use bs58;
+use ripemd;
+use tiny_keccak;
 
 /// Error types for wallet operations
 #[derive(Debug, Error)]
@@ -32,8 +35,6 @@ pub enum WalletError {
 pub enum Network {
     /// Bitcoin mainnet
     Bitcoin,
-    /// Bitcoin testnet
-    BitcoinTestnet,
     /// Ethereum
     Ethereum,
 }
@@ -43,7 +44,6 @@ impl Network {
     pub fn derivation_path_prefix(&self) -> &'static str {
         match self {
             Network::Bitcoin => "m/44'/0'/0'",       // BIP44 Bitcoin
-            Network::BitcoinTestnet => "m/44'/1'/0'", // BIP44 Bitcoin Testnet
             Network::Ethereum => "m/44'/60'/0'",     // BIP44 Ethereum
         }
     }
@@ -249,45 +249,60 @@ fn generate_public_key(private_key: &SecureBytes) -> Result<Vec<u8>, WalletError
 
 /// Generate wallet address from public key and network
 fn generate_address(public_key: &[u8], network: Network) -> Result<String, WalletError> {
-    // This is a placeholder. A real implementation would follow the address
-    // generation algorithm for each network (e.g., Base58Check for Bitcoin).
-    
     match network {
         Network::Bitcoin => {
-            // Hash public key: RIPEMD160(SHA256(public_key))
+            // For Bitcoin:
+            // 1. Hash public key with SHA256
             let mut context = Context::new(&SHA256);
             context.update(public_key);
             let sha256 = context.finish();
             
-            // We don't have RIPEMD160 in ring, so we'll use SHA256 again
-            let mut context = Context::new(&SHA256);
-            context.update(sha256.as_ref());
-            let digest = context.finish();
+            // 2. Hash the result with RIPEMD160
+            // Since ring doesn't have RIPEMD160, use ripemd from the crate
+            let ripemd160 = ripemd::Ripemd160::digest(sha256.as_ref());
             
-            // Format for Bitcoin: base58check with version byte 0x00
+            // 3. Add version byte (0x00 for mainnet)
             let mut with_version = Vec::with_capacity(21);
             with_version.push(0x00); // Version byte for mainnet
-            with_version.extend_from_slice(&digest.as_ref()[0..20]);
+            with_version.extend_from_slice(&ripemd160);
             
-            // Base58 encoding (simplified, real implementation would include checksum)
-            Ok(format!("1{}", hex::encode(&with_version[0..5])))
-        }
-        Network::BitcoinTestnet => {
-            // Similar to Bitcoin but with different version byte
-            let mut context = Context::new(&SHA256);
-            context.update(public_key);
-            let digest = context.finish();
+            // 4. Calculate checksum (first 4 bytes of double SHA256)
+            let mut checksum_ctx = Context::new(&SHA256);
+            checksum_ctx.update(&with_version);
+            let checksum1 = checksum_ctx.finish();
             
-            Ok(format!("m{}", hex::encode(&digest.as_ref()[0..5])))
+            let mut checksum_ctx = Context::new(&SHA256);
+            checksum_ctx.update(checksum1.as_ref());
+            let checksum2 = checksum_ctx.finish();
+            
+            // 5. Append checksum to versioned hash
+            let mut to_encode = with_version.clone();
+            to_encode.extend_from_slice(&checksum2.as_ref()[0..4]);
+            
+            // 6. Encode with Base58
+            let address = bs58::encode(to_encode).into_string();
+            
+            Ok(address)
         }
         Network::Ethereum => {
-            // For Ethereum: Keccak-256 hash of public key, take last 20 bytes
-            let mut context = Context::new(&SHA256);
-            context.update(public_key);
-            let digest = context.finish();
+            // For Ethereum:
+            // 1. Use Keccak-256 hash of public key (exclude the first byte)
+            let key_without_prefix = if public_key.len() == 65 && public_key[0] == 0x04 {
+                &public_key[1..] // Remove the 0x04 prefix for uncompressed keys
+            } else {
+                public_key
+            };
             
-            // Format for Ethereum: 0x + 20 bytes in hex
-            Ok(format!("0x{}", hex::encode(&digest.as_ref()[12..32])))
+            use tiny_keccak::{Hasher, Keccak};
+            let mut keccak = Keccak::v256();
+            let mut hash = [0u8; 32];
+            keccak.update(key_without_prefix);
+            keccak.finalize(&mut hash);
+            
+            // 2. Take the last 20 bytes as the Ethereum address
+            let eth_address = format!("0x{}", hex::encode(&hash[12..32]));
+            
+            Ok(eth_address.to_lowercase())
         }
     }
 }

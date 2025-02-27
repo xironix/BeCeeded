@@ -9,11 +9,15 @@ pub mod mnemonic;
 pub mod wallet;
 pub mod memory;
 pub mod logger;
+pub mod scanner;
+pub mod db;
+pub mod ocr;
 
 // Public re-exports
 pub use parser::{Parser, ParserConfig, ParserError};
 pub use mnemonic::{Mnemonic, MnemonicError};
 pub use wallet::{Wallet, WalletError};
+pub use scanner::{Scanner, ScannerConfig, ScannerError};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

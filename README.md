@@ -10,6 +10,8 @@ A Rust implementation of the CEED Parser, providing high-performance cryptocurre
 - **Multi-language Support**: Process seed phrases in multiple languages
 - **Memory Safety**: Secure memory handling for sensitive cryptographic material
 - **Command-line Interface**: Easy-to-use CLI for common operations
+- **Advanced Scanner**: Scan files and directories for potential cryptocurrency seed phrases and private keys
+- **Multiple Scan Modes**: Configure scan depth and performance trade-offs based on your needs
 
 ## Installation
 
@@ -114,4 +116,36 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - Original C implementation: [CEED Parser](https://github.com/yourusername/ceed_parser)
 - [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki) for mnemonic seed phrase specification
-- [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki) and [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki) for hierarchical deterministic wallet specification 
+- [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki) and [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki) for hierarchical deterministic wallet specification
+
+### Scanner Usage
+
+BeCeeded includes a powerful scanner for finding cryptocurrency seed phrases and private keys in files:
+
+```bash
+# Basic scan of a directory
+bcscan --directory /path/to/scan
+
+# Use fast mode for quick results
+bcscan --directory /path/to/scan --mode fast
+
+# Comprehensive scan with all features enabled
+bcscan --directory /path/to/scan --mode comprehensive
+
+# Scan with 8 threads
+bcscan --directory /path/to/scan --threads 8
+
+# Scan with custom database path
+bcscan --directory /path/to/scan --database results.db
+```
+
+#### Scan Modes
+
+The scanner offers four operational modes that allow you to balance between speed and thoroughness:
+
+| Mode | Description | Use Case | Relative Speed |
+|------|-------------|----------|---------------|
+| `fast` | Text files only, no fuzzy matching | Initial quick scan | 10x |
+| `default` | Text files with fuzzy matching | General usage | 5x |
+| `enhanced` | Adds OCR for images | When images might contain phrases | 2x |
+| `comprehensive` | All file types including archives, docs, PDFs | Forensic analysis | 1x | 
