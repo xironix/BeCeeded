@@ -2,7 +2,7 @@
 name = "beceeded"
 version = "0.1.0"
 edition = "2021"
-authors = ["BeCeeded Team"]
+authors = ["I.A. Intelligent", "Steffen L. Norgren"]
 description = "A Rust implementation of ceed_parser, A high-performance tool for parsing and validating cryptocurrency seed phrases, mnemonics, and wallets."
 readme = "README.md"
 license = "MIT"
@@ -21,25 +21,27 @@ hex = "0.4.3"                  # Hex encoding/decoding
 unicode-normalization = "0.1.23"  # Unicode normalization (NFKD for mnemonic phrases)
 
 # Cryptocurrency support
-secp256k1 = { version = "0.27.0", features = ["rand"] } # Bitcoin key operations
+secp256k1 = { version = "0.30.0", features = ["rand"] } # Bitcoin key operations
 tiny-keccak = { version = "2.0.2", features = ["sha3"] } # Ethereum hashing
 bs58 = "0.5.0"                  # Base58 encoding for Bitcoin addresses
 ripemd = "0.1.3"               # RIPEMD160 hashing for Bitcoin addresses
 
 # OCR functionality
 leptess = { version = "0.14.0", optional = true }  # Tesseract OCR bindings
-image = { version = "0.24.7", optional = true }    # Image processing
-imageproc = { version = "0.23.0", optional = true } # Advanced image processing
+image = { version = "0.25.5", optional = true }    # Image processing
+imageproc = { version = "0.25.0", optional = true } # Advanced image processing
 
 # Memory and security
 zeroize = { version = "1.8.1", features = ["derive"] } # Secure memory zeroing with derive feature
 secrecy = "0.10.3"              # Handling sensitive data - specified version
 
 # Add PBKDF2 implementation (if not already present)
-pbkdf2 = "0.11.0"
+pbkdf2 = "0.12.2"
 
 # Database functionality
-rusqlite = { version = "0.31.0", features = ["bundled"] } # SQLite for Rust
+rusqlite = { version = "0.33.0", features = ["bundled", "sqlcipher"] } # SQLite for Rust with encryption support
+dirs = "5.0.1"                  # Platform-specific directory paths
+rpassword = "7.3.1"             # Password input without echoing to screen
 
 # Scanner functionality
 num_cpus = "1.16.0"             # CPU count detection for parallel processing
@@ -48,14 +50,14 @@ strsim = "0.11.0"               # String similarity for fuzzy matching
 regex = "1.10.3"                # Regular expressions for pattern matching
 
 # Document format support
-zip = { version = "0.6.6", optional = true }      # ZIP file processing
-pdf = { version = "0.8.1", optional = true }      # PDF parsing
-quick-xml = { version = "0.31.0", optional = true } # For DOCX/XLSX parsing
+zip = { version = "2.2.3", optional = true }      # ZIP file processing
+pdf = { version = "0.9.0", optional = true }      # PDF parsing
+quick-xml = { version = "0.37.2", optional = true } # For DOCX/XLSX parsing
 tempfile = "3.17.1"                              # Needed for temp files when extracting
 
 [dev-dependencies]
 # We use criterion solely for benchmarking, not testing
-criterion = { version = "0.4", features = ["html_reports"] }
+criterion = { version = "0.5.1", features = ["html_reports"] }
 
 # Standard Rust testing framework is used for unit tests
 # PropTest is used when we need property-based testing
@@ -63,14 +65,12 @@ proptest = "1.6.0"             # Property-based testing with stochastic inputs
 
 [[bench]]
 name = "parser_benchmarks"
-harness = false
-
-[[bench]]
-name = "mnemonic_benchmarks"
+path = "benches/parser_benchmark.rs"
 harness = false
 
 [[bench]]
 name = "scanner_benchmarks"
+path = "benches/scanner_benchmarks.rs"
 harness = false
 
 [[bin]]
@@ -90,8 +90,6 @@ default = []
 no_std = []
 # Add alloc feature for use with no_std
 alloc = []
-# Add criterion feature for benchmarking
-criterion = ["dep:criterion"]
 # OCR features
 ocr = ["dep:leptess", "dep:image", "dep:imageproc"]
 # Document format support
@@ -99,3 +97,5 @@ docx = ["dep:zip", "dep:quick-xml"]
 xlsx = ["dep:zip", "dep:quick-xml"]
 pdf_support = ["dep:pdf"]
 archive = ["dep:zip"]
+# Enable database encryption
+encrypted_db = []

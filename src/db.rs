@@ -4,52 +4,86 @@
 // for storing and retrieving found seed phrases and private keys.
 
 use crate::scanner::{DbController, FoundEthKey, FoundPhrase, Result, ScannerError};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 /// SQLite-based database controller
 pub struct SqliteDbController {
     /// Database connection
-    conn: Arc<Mutex<Connection>>,
+    conn: Mutex<Connection>,
     
     /// Path to the database file
-    db_path: Option<String>,
+    db_path: Option<PathBuf>,
     
     /// Whether the database is in memory
     in_memory: bool,
+    
+    /// Whether the database is encrypted
+    encrypted: bool,
 }
 
 impl SqliteDbController {
-    /// Create a new SQLite database controller with a file
+    /// Create a new SQLite database controller
     pub fn new(db_path: &str) -> Result<Self> {
-        let conn = Connection::open(db_path).map_err(|e| {
-            error!("Failed to open database: {}", e);
-            ScannerError::DatabaseError(format!("Failed to open database: {}", e))
-        })?;
-        
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            db_path: Some(db_path.to_string()),
-            in_memory: false,
-        })
+        Self::new_with_options(db_path, None, false)
     }
-    
+
+    /// Create a new encrypted SQLite database controller
+    pub fn new_encrypted(db_path: &str, encryption_key: &str) -> Result<Self> {
+        Self::new_with_options(db_path, Some(encryption_key), false)
+    }
+
     /// Create a new in-memory SQLite database controller
     pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            error!("Failed to open in-memory database: {}", e);
-            ScannerError::DatabaseError(format!("Failed to open in-memory database: {}", e))
+        Self::new_with_options(":memory:", None, true)
+    }
+    
+    /// Create a new SQLite database controller with custom options
+    fn new_with_options(db_path: &str, encryption_key: Option<&str>, in_memory: bool) -> Result<Self> {
+        // Connect to the database
+        let conn_result = if in_memory {
+            Connection::open_in_memory()
+        } else {
+            // Ensure the parent directory exists
+            if let Some(parent) = Path::new(db_path).parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| ScannerError::DatabaseError(format!("Failed to create database directory: {}", e)))?;
+                }
+            }
+            
+            Connection::open(db_path)
+        };
+        
+        let conn = conn_result.map_err(|e| {
+            ScannerError::DatabaseError(format!("Failed to connect to database: {}", e))
         })?;
         
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            db_path: None,
-            in_memory: true,
-        })
+        // Create controller
+        let mut controller = Self {
+            conn: Mutex::new(conn),
+            db_path: if in_memory { None } else { Some(PathBuf::from(db_path)) },
+            in_memory,
+            encrypted: encryption_key.is_some(),
+        };
+        
+        // Apply encryption if provided
+        if let Some(key) = encryption_key {
+            let mut conn = controller.conn.lock().unwrap();
+            conn.execute_batch(&format!("PRAGMA key = '{}';", key))
+                .map_err(|e| {
+                    ScannerError::DatabaseError(format!("Failed to set encryption key: {}", e))
+                })?;
+        }
+        
+        // Initialize database schema
+        controller.init()?;
+        
+        Ok(controller)
     }
     
     /// Execute a database transaction with the given function
@@ -400,6 +434,36 @@ impl DbController for SqliteDbController {
         
         Ok(())
     }
+}
+
+/// Get the application data directory to store the SQLite database
+pub fn get_app_data_dir() -> Result<PathBuf> {
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| ScannerError::DatabaseError("Could not determine home directory".to_string()))?;
+    
+    #[cfg(target_os = "macos")]
+    let app_data_dir = home_dir.join("Library").join("Application Support").join("BeCeeded");
+    
+    #[cfg(target_os = "linux")]
+    let app_data_dir = home_dir.join(".local").join("share").join("BeCeeded");
+    
+    #[cfg(target_os = "windows")]
+    let app_data_dir = home_dir.join("AppData").join("Local").join("BeCeeded");
+    
+    // Create the directory if it doesn't exist
+    if !app_data_dir.exists() {
+        std::fs::create_dir_all(&app_data_dir)
+            .map_err(|e| ScannerError::DatabaseError(format!("Failed to create app data directory: {}", e)))?;
+    }
+    
+    Ok(app_data_dir)
+}
+
+/// Get the default database path for the application
+pub fn get_default_db_path() -> Result<String> {
+    let app_data_dir = get_app_data_dir()?;
+    let db_path = app_data_dir.join("beceeded.db");
+    Ok(db_path.to_string_lossy().to_string())
 }
 
 #[cfg(test)]

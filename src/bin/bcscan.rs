@@ -4,7 +4,7 @@
 // for potential cryptocurrency seed phrases and private keys.
 
 use beceeded::{
-    db::SqliteDbController,
+    db::{SqliteDbController, get_default_db_path},
     init_with_log_level,
     parser::{Parser, ParserConfig},
     scanner::{ScanMode, ScannerConfig, Scanner},
@@ -51,25 +51,42 @@ struct Cli {
     #[arg(short = 'l', long, value_name = "NAME", default_value = "english")]
     wordlist: String,
 
-    /// Database file path
-    #[arg(short, long, value_name = "FILE", default_value = "beceeded-scan.db")]
-    database: String,
+    /// Database file path (if not specified, uses ~/.local/share/BeCeeded/beceeded.db on Linux)
+    #[arg(short, long, value_name = "FILE")]
+    database: Option<String>,
 
     /// Use in-memory database (faster but doesn't persist data)
     #[arg(long)]
     memory_db: bool,
+    
+    /// Use encrypted database (prompts for password)
+    #[cfg(feature = "encrypted_db")]
+    #[arg(long)]
+    encrypted: bool,
 
     /// Disable Ethereum private key scanning
     #[arg(long)]
     no_eth: bool,
 
-    /// Disable fuzzy matching
+    /// Disable fuzzy matching for seed phrases
     #[arg(long)]
     no_fuzzy: bool,
 
-    /// Disable OCR processing for images
+    /// Disable OCR for image files
     #[arg(long)]
     no_ocr: bool,
+    
+    /// Disable scanning of archive files (zip, tar, etc.)
+    #[arg(long)]
+    no_archives: bool,
+    
+    /// Disable scanning of document files (docx, xlsx, etc.)
+    #[arg(long)]
+    no_documents: bool,
+    
+    /// Disable scanning of PDF files
+    #[arg(long)]
+    no_pdfs: bool,
 
     /// File extensions to include (comma-separated)
     #[arg(long, value_name = "EXT1,EXT2,...")]
@@ -193,12 +210,65 @@ fn main() {
             }
         }
     } else {
-        info!("Using database file: {}", cli.database);
-        match SqliteDbController::new(&cli.database) {
-            Ok(db) => Box::new(db),
-            Err(e) => {
-                error!("Failed to create database: {}", e);
-                process::exit(1);
+        // Get database path
+        let db_path = match &cli.database {
+            Some(path) => path.clone(),
+            None => match get_default_db_path() {
+                Ok(path) => {
+                    info!("Using default database path: {}", path);
+                    path
+                },
+                Err(e) => {
+                    error!("Failed to determine default database path: {}", e);
+                    process::exit(1);
+                }
+            }
+        };
+
+        #[cfg(feature = "encrypted_db")]
+        if cli.encrypted {
+            use std::io::{self, Write};
+            use rpassword::read_password;
+            
+            // Prompt for password
+            print!("Enter database encryption password: ");
+            io::stdout().flush().unwrap();
+            let password = match read_password() {
+                Ok(pwd) => pwd,
+                Err(e) => {
+                    error!("Failed to read password: {}", e);
+                    process::exit(1);
+                }
+            };
+            
+            info!("Using encrypted database file: {}", db_path);
+            match SqliteDbController::new_encrypted(&db_path, &password) {
+                Ok(db) => Box::new(db),
+                Err(e) => {
+                    error!("Failed to create encrypted database: {}", e);
+                    process::exit(1);
+                }
+            }
+        } else {
+            info!("Using database file: {}", db_path);
+            match SqliteDbController::new(&db_path) {
+                Ok(db) => Box::new(db),
+                Err(e) => {
+                    error!("Failed to create database: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        
+        #[cfg(not(feature = "encrypted_db"))]
+        {
+            info!("Using database file: {}", db_path);
+            match SqliteDbController::new(&db_path) {
+                Ok(db) => Box::new(db),
+                Err(e) => {
+                    error!("Failed to create database: {}", e);
+                    process::exit(1);
+                }
             }
         }
     };
@@ -248,9 +318,12 @@ fn main() {
         exclude_extensions,
         use_fuzzy_matching: !cli.no_fuzzy,
         use_ocr: !cli.no_ocr,
-        min_bip39_words: cli.min_words,
-        fuzzy_threshold: cli.fuzzy_threshold,
-        write_logs: !cli.no_logs,
+        scan_archives: !cli.no_archives,
+        scan_documents: !cli.no_documents,
+        scan_pdfs: !cli.no_pdfs,
+        min_bip39_words: 11,
+        fuzzy_threshold: 0.85,
+        write_logs: true,
     };
 
     // Create scanner
