@@ -4,7 +4,7 @@
 // It serves as an integration point for external OCR libraries.
 
 use crate::scanner::{Result, ScannerError};
-use log::{debug, error, info, warn};
+use log::warn;
 use std::path::Path;
 
 /// OCR engine options

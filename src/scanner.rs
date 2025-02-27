@@ -11,18 +11,16 @@ use crate::{
 };
 use log::{debug, error, info, trace, warn};
 use rayon::prelude::*;
-use secrecy::ExposeSecret;
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 use thiserror::Error;
 use hex;

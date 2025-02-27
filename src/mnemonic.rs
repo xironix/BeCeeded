@@ -12,7 +12,7 @@
  * - Unicode normalization is handled efficiently for all languages
  */
 
-use crate::memory::{SecureBytes, SecureString};
+use crate::memory::SecureString;
 use crate::parser::{Parser, ParserError, ParserConfig};
 use ring::digest::{Context, SHA256};
 use ring::pbkdf2;

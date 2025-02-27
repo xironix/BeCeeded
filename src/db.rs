@@ -4,11 +4,11 @@
 // for storing and retrieving found seed phrases and private keys.
 
 use crate::scanner::{DbController, FoundEthKey, FoundPhrase, Result, ScannerError};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 /// SQLite-based database controller
@@ -73,7 +73,7 @@ impl SqliteDbController {
         
         // Apply encryption if provided
         if let Some(key) = encryption_key {
-            let mut conn = controller.conn.lock().unwrap();
+            let conn = controller.conn.lock().unwrap();
             conn.execute_batch(&format!("PRAGMA key = '{}';", key))
                 .map_err(|e| {
                     ScannerError::DatabaseError(format!("Failed to set encryption key: {}", e))
@@ -307,7 +307,7 @@ impl DbController for SqliteDbController {
     fn get_all_phrases(&self) -> Result<Vec<FoundPhrase>> {
         debug!("Fetching all phrases from database");
         
-        let mut conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         
         // Prepare the query
         let mut stmt = conn.prepare(
@@ -388,7 +388,7 @@ impl DbController for SqliteDbController {
     fn get_all_eth_keys(&self) -> Result<Vec<FoundEthKey>> {
         debug!("Fetching all Ethereum keys from database");
         
-        let mut conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         
         // Prepare the query
         let mut stmt = conn.prepare(
