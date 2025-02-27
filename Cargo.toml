@@ -24,9 +24,12 @@ unicode-normalization = "0.1.23"  # Unicode normalization (NFKD for mnemonic phr
 zeroize = { version = "1.8.1", features = ["derive"] } # Secure memory zeroing with derive feature
 secrecy = "0.10.3"              # Handling sensitive data - specified version
 
+# Add PBKDF2 implementation (if not already present)
+pbkdf2 = "0.11.0"
+
 [dev-dependencies]
 # We use criterion solely for benchmarking, not testing
-criterion = "0.5.1"            # Benchmarking
+criterion = { version = "0.4", features = ["html_reports"] }
 
 # Standard Rust testing framework is used for unit tests
 # PropTest is used when we need property-based testing
@@ -34,7 +37,11 @@ proptest = "1.6.0"             # Property-based testing with stochastic inputs
 tempfile = "3.17.1"            # Temporary file handling for tests
 
 [[bench]]
-name = "parser_benchmark"
+name = "parser_benchmarks"
+harness = false
+
+[[bench]]
+name = "mnemonic_benchmarks"
 harness = false
 
 [profile.release]
@@ -43,3 +50,12 @@ codegen-units = 1              # Slower compile, better optimization
 panic = "abort"                # Smaller binary size
 strip = true                   # Strip symbols from binary
 debug = false                  # No debug symbols
+
+[features]
+default = []
+# Add no_std feature for embedded contexts
+no_std = []
+# Add alloc feature for use with no_std
+alloc = []
+# Add criterion feature for benchmarking
+criterion = ["dep:criterion"]

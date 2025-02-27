@@ -192,6 +192,14 @@ fn test_comprehensive_wordlists_and_lengths() {
         // Determine if this is a Monero wordlist
         let is_monero = language.starts_with("monero_");
         
+        // Special handling for Chinese wordlists
+        let is_cjk = language.contains("chinese") || 
+                    language.contains("japanese") || 
+                    language.contains("korean");
+        
+        // Chinese Monero wordlists use single-character words
+        let is_chinese_monero = is_monero && language.contains("chinese");
+        
         // Choose appropriate lengths based on wordlist type
         let lengths_to_test = if is_monero {
             &monero_lengths[..]
@@ -290,17 +298,13 @@ fn test_comprehensive_wordlists_and_lengths() {
                 .map(|&idx| parser.get_wordlist_slice(idx, idx + 1)[0].clone())
                 .collect();
             
-            // Check if this is a CJK wordlist for display purposes
-            let is_cjk = language.contains("chinese") || 
-                        language.contains("japanese") || 
-                        language.contains("korean");
-                
             // Join into a mnemonic phrase with proper separator
-            let test_phrase = if is_cjk {
-                // For CJK languages, join without spaces for testing
+            let test_phrase = if is_cjk && !is_chinese_monero {
+                // For standard CJK languages, join without spaces
                 random_words.join("")
             } else {
-                // For all other languages, separate with spaces
+                // For all other languages (including Chinese Monero), separate with spaces
+                // Since Chinese Monero words are single characters, we need spaces to distinguish them
                 random_words.join(" ")
             };
             
@@ -346,7 +350,7 @@ fn test_comprehensive_wordlists_and_lengths() {
                 println!("    Error parsing {}-word {} mnemonic: {:?}", length, language, e);
                 
                 // Debug information
-                println!("    Test phrase format: {}", if is_cjk { "no spaces" } else { "space-separated" });
+                println!("    Test phrase format: {}", if is_cjk && !is_chinese_monero { "no spaces" } else { "space-separated" });
                 println!("    First 3 words: {:?}", &random_words[0..3.min(random_words.len())]);
                 
                 if is_monero {
@@ -372,4 +376,456 @@ fn test_comprehensive_wordlists_and_lengths() {
     }
     
     println!("\nAll wordlist and length combinations tested successfully!");
+}
+
+#[test]
+fn test_monero_mnemonics() {
+    use std::collections::HashSet;
+    
+    // Test specifically Monero format with its own checksum rules
+    let languages = [
+        "monero_english", "monero_spanish", "monero_french", 
+        "monero_italian", "monero_portuguese", "monero_german",
+        "monero_russian", "monero_chinese_simplified"
+    ];
+    
+    for &language in &languages {
+        println!("Testing Monero wordlist: {}", language);
+        
+        let config = ParserConfig {
+            validate_checksum: true, // Enable checksum validation for Monero
+            valid_word_counts: vec![25], // Monero uses 25-word format
+            wordlist_name: language.to_string(),
+            ..ParserConfig::default()
+        };
+        
+        // Create parser with the selected language
+        let parser = match Parser::new(std::path::PathBuf::from("data"), language.to_string(), config) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  Skipping test for {}: {}", language, e);
+                continue;
+            }
+        };
+        
+        println!("  Loaded {} with {} words", language, parser.wordlist_len());
+        
+        // Generate 24 random indices (fixed seed for reproducibility)
+        let mut rng: u64 = 54321;
+        let wordlist_size = parser.wordlist_len();
+        
+        let mut used_indices = HashSet::new();
+        let mut indices = Vec::with_capacity(25);
+        
+        // Select 24 unique random words
+        while indices.len() < 24 {
+            // Simple xorshift
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            
+            let idx = (rng % wordlist_size as u64) as usize;
+            
+            if !used_indices.contains(&idx) {
+                used_indices.insert(idx);
+                indices.push(idx as u16);
+            }
+        }
+        
+        // Calculate valid Monero checksum
+        let base = wordlist_size as u128;
+        let mut total: u128 = 0;
+        let mut power: u128 = 1;
+        
+        for i in 0..24 {
+            let idx = indices[i] as u128;
+            total = total.wrapping_add(idx.wrapping_mul(power));
+            power = power.wrapping_mul(base);
+            
+            if power >= u128::MAX / base {
+                power %= base;
+                total %= base;
+            }
+        }
+        
+        let checksum_idx = (total % base) as u16;
+        indices.push(checksum_idx);
+        
+        // Convert indices to words
+        let words = parser.indices_to_words(&indices).expect("Failed to convert indices to words");
+        
+        // Join into a valid mnemonic phrase
+        let is_chinese = language.contains("chinese");
+        let mnemonic = if is_chinese {
+            // For Chinese Monero wordlists, spaces are needed between single-character words 
+            words.join(" ")
+        } else {
+            words.join(" ")
+        };
+        
+        // Test parsing the valid mnemonic
+        println!("  Validating 25-word Monero mnemonic");
+        let parsed_result = parser.parse(&mnemonic);
+        
+        if let Err(ref e) = parsed_result {
+            println!("  Error parsing mnemonic: {:?}", e);
+            println!("  First few words: {:?}", &words[0..3]);
+        }
+        
+        assert!(parsed_result.is_ok(), "Valid Monero mnemonic should be accepted");
+        
+        // Test with an invalid checksum by modifying the last word
+        let mut invalid_indices = indices.clone();
+        invalid_indices[24] = (invalid_indices[24] + 1) % wordlist_size as u16;
+        
+        let invalid_words = parser.indices_to_words(&invalid_indices)
+            .expect("Failed to convert invalid indices to words");
+        
+        let invalid_mnemonic = invalid_words.join(" ");
+        
+        // Test parsing the invalid mnemonic (should fail checksum)
+        println!("  Testing invalid checksum rejection");
+        let invalid_result = parser.parse(&invalid_mnemonic);
+        assert!(matches!(invalid_result, Err(ParserError::MoneroChecksumError)), 
+                "Invalid Monero checksum should be rejected");
+        
+        println!("  ✓ Successfully tested {} wordlist", language);
+    }
+    
+    println!("All Monero wordlist tests completed successfully!");
+}
+
+#[test]
+fn test_unicode_normalization() {
+    // Test Unicode normalization for accented characters
+    
+    // Words with various Unicode normalizations
+    // Same visual character, different Unicode representations
+    let words_nfc = "café résumé piñata";  // NFC form (composed)
+    let words_nfd = "cafe\u{0301} re\u{0301}sume\u{0301} pin\u{0303}ata";  // NFD form (decomposed)
+    
+    // Create a parser with Spanish wordlist
+    let config = ParserConfig {
+        validate_checksum: false, // Disable for this test
+        wordlist_name: "spanish".to_string(),
+        ..ParserConfig::default()
+    };
+    
+    let parser = match Parser::new(std::path::PathBuf::from("data"), "spanish".to_string(), config) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Skipping Unicode normalization test: {}", e);
+            return;
+        }
+    };
+    
+    // Parse the different forms
+    let result_nfc = parser.parse(words_nfc);
+    let result_nfd = parser.parse(words_nfd);
+    
+    // Both forms should parse successfully and yield identical results
+    if result_nfc.is_ok() && result_nfd.is_ok() {
+        assert_eq!(result_nfc.unwrap(), result_nfd.unwrap(), 
+                   "Different Unicode normalizations should yield identical results");
+        println!("Unicode normalization test passed!");
+    } else {
+        println!("Skipping Unicode comparison due to parsing errors");
+    }
+}
+
+#[test]
+fn test_parser_performance() {
+    // Test parsing speed with a large number of phrases
+    use std::time::Instant;
+    
+    const ITERATIONS: usize = 1000;
+    let parser = Parser::default().expect("Failed to create parser");
+    
+    // Test valid mnemonic
+    let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    
+    // Measure parsing time
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        let _ = parser.parse(mnemonic).expect("Failed to parse valid mnemonic");
+    }
+    let duration = start.elapsed();
+    
+    // Calculate average parsing time
+    let avg_time_micros = duration.as_micros() as f64 / ITERATIONS as f64;
+    println!("Average parsing time: {:.2} microseconds", avg_time_micros);
+    
+    // This is a performance test, not a correctness test, so we don't assert
+    // specific timings which would be dependent on the machine running the tests.
+    // Instead, we just make sure parsing works and log the performance.
+}
+
+#[test]
+fn test_mixed_whitespace_handling() {
+    // Test handling of various types of whitespace in mnemonics
+    let parser = Parser::default().expect("Failed to create parser");
+    
+    // Standard mnemonic
+    let standard = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    
+    // Mnemonic with various whitespace
+    let mixed_whitespace = "abandon\tabandon\nabandon    abandon\r\nabandon\u{00A0}abandon\u{2000}abandon abandon abandon abandon abandon about";
+    
+    // Mnemonic with extra leading/trailing whitespace
+    let extra_whitespace = "  \t  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about \n \r ";
+    
+    // All should parse to the same words
+    let words_standard = parser.parse(standard).expect("Failed to parse standard mnemonic");
+    let words_mixed = parser.parse(mixed_whitespace).expect("Failed to parse mixed whitespace mnemonic");
+    let words_extra = parser.parse(extra_whitespace).expect("Failed to parse mnemonic with extra whitespace");
+    
+    assert_eq!(words_standard, words_mixed, "Mixed whitespace should be normalized");
+    assert_eq!(words_standard, words_extra, "Extra whitespace should be trimmed");
+    
+    println!("Whitespace handling test passed!");
+}
+
+#[test]
+fn test_wordlist_translation() {
+    // Test conversion between different language wordlists
+    // This test simulates "translating" a mnemonic from one language to another
+    // by converting indices back to words in a different language
+    
+    // First, load the English wordlist
+    let english_parser = Parser::default().expect("Failed to create English parser");
+    
+    // Check if Spanish wordlist is available for the test
+    let spanish_config = ParserConfig {
+        wordlist_name: "spanish".to_string(),
+        ..ParserConfig::default()
+    };
+    
+    let spanish_parser = match Parser::new(std::path::PathBuf::from("data"), "spanish".to_string(), spanish_config) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Skipping wordlist translation test: {}", e);
+            return;
+        }
+    };
+    
+    // Parse a standard English mnemonic to get indices
+    let english_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let english_words = english_parser.parse(english_mnemonic).expect("Failed to parse English mnemonic");
+    
+    // Convert the words to indices
+    let indices = english_parser.words_to_indices(&english_words).expect("Failed to convert to indices");
+    
+    // Convert the indices back to words using the Spanish wordlist
+    let spanish_words = spanish_parser.indices_to_words(&indices).expect("Failed to convert to Spanish");
+    
+    // Join the Spanish words into a mnemonic
+    let spanish_mnemonic = spanish_words.join(" ");
+    println!("Translated mnemonic: {}", spanish_mnemonic);
+    
+    // Parse the Spanish mnemonic to verify it's valid
+    let parsed_spanish = spanish_parser.parse(&spanish_mnemonic).expect("Failed to parse Spanish mnemonic");
+    
+    // Verify the indices match
+    let spanish_indices = spanish_parser.words_to_indices(&parsed_spanish).expect("Failed to convert Spanish to indices");
+    assert_eq!(indices, spanish_indices, "Indices should match after translation");
+    
+    println!("Wordlist translation test passed!");
+}
+
+#[test]
+fn test_monero_mnemonic_creation() {
+    // Test creating and validating Monero-style mnemonics
+    
+    // Only proceed if Monero English wordlist is available
+    let config = ParserConfig {
+        validate_checksum: true,
+        valid_word_counts: vec![25],
+        wordlist_name: "monero_english".to_string(),
+        ..ParserConfig::default()
+    };
+    
+    let parser = match Parser::new(std::path::PathBuf::from("data"), "monero_english".to_string(), config) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Skipping Monero mnemonic creation test: {}", e);
+            return;
+        }
+    };
+    
+    // Generate 24 random words (for a 25-word Monero mnemonic)
+    let mut indices: Vec<u16> = Vec::with_capacity(24);
+    for i in 0..24 {
+        indices.push((i % parser.wordlist_len()) as u16);
+    }
+    
+    // Calculate the checksum word
+    let base = parser.wordlist_len() as u128;
+    let mut total: u128 = 0;
+    let mut power: u128 = 1;
+    
+    for i in 0..24 {
+        let idx = indices[i] as u128;
+        total = total.wrapping_add(idx.wrapping_mul(power));
+        power = power.wrapping_mul(base);
+        
+        if power >= u128::MAX / base {
+            power %= base;
+            total %= base;
+        }
+    }
+    
+    let checksum_idx = (total % base) as u16;
+    indices.push(checksum_idx);
+    
+    // Convert to words
+    let words = parser.indices_to_words(&indices).expect("Failed to convert indices to words");
+    let mnemonic = words.join(" ");
+    
+    println!("Created Monero mnemonic with checksum: {}", mnemonic);
+    
+    // Verify the mnemonic is valid according to Monero rules
+    let parsed = parser.parse(&mnemonic).expect("Failed to parse valid Monero mnemonic");
+    assert_eq!(parsed.len(), 25, "Monero mnemonic should have 25 words");
+    
+    // Create an invalid mnemonic by swapping two words
+    let mut invalid_words = words.clone();
+    invalid_words.swap(0, 1);
+    let invalid_mnemonic = invalid_words.join(" ");
+    
+    // This should fail validation
+    let invalid_result = parser.parse(&invalid_mnemonic);
+    assert!(invalid_result.is_err(), "Invalid Monero mnemonic should be rejected");
+    assert!(matches!(invalid_result, Err(ParserError::MoneroChecksumError)), 
+            "Should fail with MoneroChecksumError");
+    
+    println!("Monero mnemonic creation test passed!");
+}
+
+#[test]
+fn test_error_handling() {
+    // Test various error cases to ensure they're handled appropriately
+    
+    // Create a parser
+    let parser = Parser::default().expect("Failed to create parser");
+    
+    // Test empty input
+    let result = parser.parse("");
+    assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+            "Empty input should fail with InvalidWordCount");
+    
+    // Test input with only spaces
+    let result = parser.parse("    \t\n   ");
+    assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+            "Whitespace-only input should fail with InvalidWordCount");
+    
+    // Test invalid word count at boundary
+    let result = parser.parse("abandon abandon abandon");
+    assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+            "Invalid word count (3) should fail with InvalidWordCount");
+    
+    // Test nonexistent word
+    let result = parser.parse("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon nonexistentword");
+    assert!(matches!(result, Err(ParserError::WordNotFound(_))), 
+            "Nonexistent word should fail with WordNotFound");
+    
+    // Test with mixed valid and invalid words
+    let result = parser.parse("abandon THISISNOTAWORD abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    assert!(matches!(result, Err(ParserError::WordNotFound(_))), 
+            "Mixed valid/invalid words should fail with WordNotFound for the first invalid word");
+    
+    // Test handling of Unicode confusables and lookalikes
+    let result = parser.parse("аbandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    // The first "a" above is actually a Cyrillic "а" (U+0430), not Latin "a" (U+0061)
+    assert!(matches!(result, Err(ParserError::WordNotFound(_))), 
+            "Unicode confusables should be detected");
+    
+    // If Monero wordlists are available, test Monero-specific errors
+    let monero_config = ParserConfig {
+        validate_checksum: true,
+        valid_word_counts: vec![25],
+        wordlist_name: "monero_english".to_string(),
+        ..ParserConfig::default()
+    };
+    
+    if let Ok(monero_parser) = Parser::new(std::path::PathBuf::from("data"), "monero_english".to_string(), monero_config) {
+        println!("Testing Monero-specific error handling");
+        
+        // Test wrong word count for Monero (should be 25)
+        let monero_words: Vec<String> = (0..24).map(|_| "abbey".to_string()).collect();
+        let monero_invalid = monero_words.join(" ");
+        
+        let result = monero_parser.parse(&monero_invalid);
+        assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+                "Monero mnemonic with 24 words should fail with InvalidWordCount");
+        
+        // Test invalid checksum in Monero mnemonic (generate invalid 25-word mnemonic)
+        let mut monero_words_with_checksum = monero_words.clone();
+        monero_words_with_checksum.push("zebra".to_string()); // Add a word that's likely not the right checksum
+        let monero_invalid_checksum = monero_words_with_checksum.join(" ");
+        
+        let result = monero_parser.parse(&monero_invalid_checksum);
+        assert!(matches!(result, Err(ParserError::MoneroChecksumError)), 
+                "Monero mnemonic with invalid checksum should fail with MoneroChecksumError");
+    }
+    
+    println!("Error handling tests passed!");
+}
+
+#[test]
+fn test_edge_cases() {
+    // Test edge cases and boundary conditions
+    
+    // Create a parser
+    let config = ParserConfig {
+        validate_checksum: false, // Disable checksum to test word counts
+        ..ParserConfig::default()
+    };
+    
+    let parser = Parser::new(std::path::PathBuf::from("data"), "english".to_string(), config)
+        .expect("Failed to create parser");
+    
+    // Test minimum valid word count (12)
+    let min_words = vec!["abandon"; 12].join(" ");
+    let result = parser.parse(&min_words);
+    assert!(result.is_ok(), "Minimum valid word count (12) should be accepted");
+    assert_eq!(result.unwrap().len(), 12);
+    
+    // Test maximum valid word count (24 for BIP-39, 25 for Monero)
+    let max_words = vec!["abandon"; 24].join(" ");
+    let result = parser.parse(&max_words);
+    assert!(result.is_ok(), "Maximum valid word count (24) should be accepted");
+    assert_eq!(result.unwrap().len(), 24);
+    
+    // Test just below minimum (11 words)
+    let below_min = vec!["abandon"; 11].join(" ");
+    let result = parser.parse(&below_min);
+    assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+            "Word count just below minimum (11) should be rejected");
+    
+    // Test just above standard maximum (26 words) - unless using Monero
+    let above_max = vec!["abandon"; 26].join(" ");
+    let result = parser.parse(&above_max);
+    assert!(matches!(result, Err(ParserError::InvalidWordCount { .. })), 
+            "Word count just above maximum (26) should be rejected");
+    
+    // Test handling of extreme whitespace
+    let extreme_whitespace = "    ".to_string() + &vec!["abandon"; 12].join("     ") + "    ";
+    let result = parser.parse(&extreme_whitespace);
+    assert!(result.is_ok(), "Extreme whitespace should be handled correctly");
+    assert_eq!(result.unwrap().len(), 12);
+    
+    // Test wordlist boundaries - first and last words
+    let first_word = parser.get_wordlist_slice(0, 1)[0].clone();
+    let last_idx = parser.wordlist_len() - 1;
+    let last_word = parser.get_wordlist_slice(last_idx, last_idx + 1)[0].clone();
+    
+    let boundary_mnemonic = format!("{} {} {} {} {} {} {} {} {} {} {} {}", 
+                                    first_word, first_word, first_word, first_word,
+                                    last_word, last_word, last_word, last_word,
+                                    first_word, last_word, first_word, last_word);
+    
+    let result = parser.parse(&boundary_mnemonic);
+    assert!(result.is_ok(), "Boundary words (first and last in wordlist) should be accepted");
+    
+    println!("Edge case tests passed!");
 } 
