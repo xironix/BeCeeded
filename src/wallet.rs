@@ -316,7 +316,7 @@ mod tests {
     
     #[test]
     fn test_wallet_from_mnemonic() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = Mnemonic::from_phrase(phrase, parser).expect("Failed to parse mnemonic");
         
@@ -343,7 +343,7 @@ mod tests {
     
     #[test]
     fn test_sign_and_verify() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = Mnemonic::from_phrase(phrase, parser).expect("Failed to parse mnemonic");
         

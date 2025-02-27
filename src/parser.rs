@@ -106,7 +106,7 @@ impl WordlistProvider for FileWordlistProvider {
         let path = self.directory.join(format!("{}.{}", self.name, extension));
         
         let file = File::open(&path)
-            .map_err(|e| ParserError::WordlistError(e))?;
+            .map_err(ParserError::WordlistError)?;
         let reader = BufReader::new(file);
         
         let mut wordlist = Vec::with_capacity(2048);
@@ -115,7 +115,7 @@ impl WordlistProvider for FileWordlistProvider {
         // For Monero wordlists in Markdown format, we need to skip header rows
         let mut line_num = 0;
         
-        for (_i, line) in reader.lines().enumerate() {
+        for line in reader.lines() {
             // Get the line
             let line = line?;
             line_num += 1;
@@ -230,7 +230,7 @@ impl Parser {
     
     /// Create a new parser with default configuration
     #[inline]
-    pub fn default() -> Result<Self, ParserError> {
+    pub fn create_default() -> Result<Self, ParserError> {
         let provider = FileWordlistProvider::new(PathBuf::from("data"), "english".to_string());
         Self::with_provider(&provider, ParserConfig::default())
     }
@@ -516,8 +516,8 @@ impl Parser {
         let mut power: u128 = 1;
         
         // Calculate sum of first 24 words
-        for i in 0..24 {
-            let idx = indices[i] as u128;
+        for &idx in indices.iter().take(24) {
+            let idx = idx as u128;
             total = total.wrapping_add(idx.wrapping_mul(power));
             power = power.wrapping_mul(base as u128);
             
@@ -602,7 +602,7 @@ mod tests {
     
     #[test]
     fn test_parse_valid_mnemonic() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let words = parser.parse(mnemonic).expect("Failed to parse valid mnemonic");
@@ -614,7 +614,7 @@ mod tests {
     
     #[test]
     fn test_parse_invalid_word() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword";
         let result = parser.parse(mnemonic);
@@ -629,7 +629,7 @@ mod tests {
     
     #[test]
     fn test_parse_invalid_word_count() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let mnemonic = "abandon abandon";
         let result = parser.parse(mnemonic);
@@ -646,7 +646,7 @@ mod tests {
     
     #[test]
     fn test_checksum_validation_valid() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         // This is a valid mnemonic with correct checksum
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -657,7 +657,7 @@ mod tests {
     
     #[test]
     fn test_checksum_validation_invalid() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         // This is an invalid mnemonic with incorrect checksum
         // "zoo" is replaced with "zero" which breaks the checksum
@@ -676,7 +676,7 @@ mod tests {
     
     #[test]
     fn test_parse_with_different_separators() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         // Test with different separators
         let mnemonic_spaces = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -693,7 +693,7 @@ mod tests {
     
     #[test]
     fn test_word_to_indices_conversion() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let words = vec![
             "abandon".to_string(),
@@ -861,7 +861,7 @@ mod tests {
     
     #[test]
     fn test_secure_parsing() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let secure = parser.parse_secure(mnemonic).expect("Failed to parse securely");
@@ -909,8 +909,8 @@ mod tests {
         let mut power: u128 = 1;
         
         // Calculate sum of first 24 words
-        for i in 0..24 {
-            let idx = indices[i] as u128;
+        for &idx in indices.iter().take(24) {
+            let idx = idx as u128;
             total = total.wrapping_add(idx.wrapping_mul(power));
             power = power.wrapping_mul(base);
             
@@ -948,7 +948,7 @@ mod tests {
     
     #[test]
     fn test_case_insensitivity() {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         // Test with mixed-case input
         let mnemonic_lowercase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";

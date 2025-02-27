@@ -15,15 +15,6 @@ use std::{
 pub struct SqliteDbController {
     /// Database connection
     conn: Mutex<Connection>,
-    
-    /// Path to the database file
-    db_path: Option<PathBuf>,
-    
-    /// Whether the database is in memory
-    in_memory: bool,
-    
-    /// Whether the database is encrypted
-    encrypted: bool,
 }
 
 impl SqliteDbController {
@@ -66,9 +57,6 @@ impl SqliteDbController {
         // Create controller
         let controller = Self {
             conn: Mutex::new(conn),
-            db_path: if in_memory { None } else { Some(PathBuf::from(db_path)) },
-            in_memory,
-            encrypted: encryption_key.is_some(),
         };
         
         // Apply encryption if provided

@@ -42,12 +42,16 @@ pub trait OcrEngine: Send + Sync {
     /// Process an image file and extract text
     fn process_image(&self, image_path: &Path) -> Result<String>;
     
+    /// Process image data from a buffer rather than a file
+    fn process_image_data(&self, image_data: &[u8], format_hint: Option<&str>) -> Result<String>;
+    
     /// Clean up resources
     fn cleanup(&self) -> Result<()>;
 }
 
 /// Tesseract OCR engine implementation
 #[cfg(feature = "ocr")]
+#[derive(Default)]
 pub struct TesseractOcr {
     initialized: bool,
     options: Option<OcrOptions>,
@@ -55,16 +59,13 @@ pub struct TesseractOcr {
     tess: Option<leptess::LepTess>,
 }
 
+
 /// Tesseract OCR implementation with leptess
 #[cfg(feature = "ocr")]
 impl TesseractOcr {
     /// Create a new TesseractOcr engine
     pub fn new() -> Self {
-        Self {
-            initialized: false,
-            options: None,
-            tess: None,
-        }
+        Self::default()
     }
     
     // Helper to set tesseract options
@@ -93,6 +94,7 @@ impl TesseractOcr {
 
 /// Tesseract OCR engine implementation for non-OCR builds
 #[cfg(not(feature = "ocr"))]
+#[derive(Default)]
 pub struct TesseractOcr {
     initialized: bool,
     options: Option<OcrOptions>,
@@ -103,12 +105,10 @@ pub struct TesseractOcr {
 impl TesseractOcr {
     /// Create a new TesseractOcr engine
     pub fn new() -> Self {
-        Self {
-            initialized: false,
-            options: None,
-        }
+        Self::default()
     }
 }
+
 
 #[cfg(feature = "ocr")]
 impl OcrEngine for TesseractOcr {
@@ -138,14 +138,59 @@ impl OcrEngine for TesseractOcr {
             return Err(ScannerError::OcrError("OCR engine not initialized".to_string()));
         }
         
-        let options = self.options.as_ref().unwrap();
-        let tess = self.tess.as_ref().unwrap();
-        
         debug!("Processing image: {}", image_path.display());
         
         // Load the image
         let img = image::open(image_path)
             .map_err(|e| ScannerError::OcrError(format!("Failed to open image: {}", e)))?;
+        
+        // Use the shared implementation for processing image data
+        self.process_image_impl(img)
+    }
+    
+    fn process_image_data(&self, image_data: &[u8], format_hint: Option<&str>) -> Result<String> {
+        // Check if initialized
+        if !self.initialized || self.tess.is_none() {
+            return Err(ScannerError::OcrError("OCR engine not initialized".to_string()));
+        }
+        
+        debug!("Processing image data: {} bytes", image_data.len());
+        
+        // Determine image format
+        let format = match format_hint {
+            Some("jpg") | Some("jpeg") => image::ImageFormat::Jpeg,
+            Some("png") => image::ImageFormat::Png,
+            Some("gif") => image::ImageFormat::Gif,
+            Some("bmp") => image::ImageFormat::Bmp,
+            Some("tiff") => image::ImageFormat::Tiff,
+            _ => {
+                // Try to guess the format from the bytes
+                image::guess_format(image_data)
+                    .map_err(|e| ScannerError::OcrError(format!("Failed to determine image format: {}", e)))?
+            }
+        };
+        
+        // Load the image from memory
+        let img = image::load_from_memory_with_format(image_data, format)
+            .map_err(|e| ScannerError::OcrError(format!("Failed to load image from memory: {}", e)))?;
+        
+        // Use the shared implementation for processing image data
+        self.process_image_impl(img)
+    }
+    
+    fn cleanup(&self) -> Result<()> {
+        debug!("Cleaning up Tesseract OCR engine");
+        // Tesseract resources are cleaned up automatically when dropped
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ocr")]
+impl TesseractOcr {
+    // Common implementation for processing an image after it's loaded
+    fn process_image_impl(&self, img: image::DynamicImage) -> Result<String> {
+        let options = self.options.as_ref().unwrap();
+        let tess = self.tess.as_ref().unwrap();
         
         // Preprocess the image if enabled
         let img = if options.preprocessing {
@@ -155,28 +200,76 @@ impl OcrEngine for TesseractOcr {
             img
         };
         
-        // Convert image to PIX format for Tesseract
-        let pix = leptess::leptonica::pix_from_image(&img)
-            .map_err(|e| ScannerError::OcrError(format!("Failed to convert image: {}", e)))?;
+        // Try multiple scaling factors for better text recognition
+        let scaling_factors = [1.0, 1.5, 2.0, 0.75, 0.5];
+        let mut best_text = String::new();
+        let mut best_confidence = 0.0;
         
-        // Set the image for OCR
-        let mut tess = tess.clone(); // We need a mutable copy
-        tess.set_image(&pix)
-            .map_err(|e| ScannerError::OcrError(format!("Failed to set image: {}", e)))?;
+        for &scale in &scaling_factors {
+            if scale != 1.0 {
+                debug!("Trying image scale factor: {}", scale);
+            }
+            
+            // Scale the image if needed
+            let scaled_img = if (scale - 1.0).abs() > 0.01 {
+                let width = (img.width() as f32 * scale) as u32;
+                let height = (img.height() as f32 * scale) as u32;
+                img.resize(width, height, image::imageops::FilterType::Lanczos3)
+            } else {
+                img.clone()
+            };
+            
+            // Convert image to PIX format for Tesseract
+            let pix = match leptess::leptonica::pix_from_image(&scaled_img) {
+                Ok(pix) => pix,
+                Err(e) => {
+                    warn!("Failed to convert image at scale {}: {}", scale, e);
+                    continue;
+                }
+            };
+            
+            // Set the image for OCR
+            let mut tess_clone = tess.clone(); // We need a mutable copy
+            if let Err(e) = tess_clone.set_image(&pix) {
+                warn!("Failed to set image at scale {}: {}", scale, e);
+                continue;
+            }
+            
+            // Perform OCR
+            let text = match tess_clone.get_utf8_text() {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("Failed to perform OCR at scale {}: {}", scale, e);
+                    continue;
+                }
+            };
+            
+            // Get mean confidence
+            let confidence = tess_clone.mean_text_conf() as f64 / 100.0;
+            debug!("OCR at scale {} completed: {} characters, confidence {:.2}", 
+                   scale, text.len(), confidence);
+            
+            // Keep the result with the highest confidence
+            if confidence > best_confidence && !text.trim().is_empty() {
+                best_confidence = confidence;
+                best_text = text;
+            }
+        }
         
-        // Perform OCR
-        let text = tess.get_utf8_text()
-            .map_err(|e| ScannerError::OcrError(format!("Failed to perform OCR: {}", e)))?;
-        
-        debug!("OCR completed with {} characters extracted", text.len());
-        
-        Ok(text)
-    }
-    
-    fn cleanup(&self) -> Result<()> {
-        debug!("Cleaning up Tesseract OCR engine");
-        // Tesseract resources are cleaned up automatically when dropped
-        Ok(())
+        // If we found text with reasonable confidence
+        if best_confidence >= options.confidence_threshold as f64 / 100.0 {
+            debug!("Final OCR result: {} characters with confidence {:.2}", 
+                   best_text.len(), best_confidence);
+            Ok(best_text)
+        } else if !best_text.is_empty() {
+            // We have text but confidence is below threshold
+            debug!("OCR confidence too low: {:.2} < {:.2}", 
+                   best_confidence, options.confidence_threshold as f64 / 100.0);
+            Ok(best_text) // Return the text anyway, let the caller decide
+        } else {
+            debug!("No text extracted from image");
+            Ok(String::new())
+        }
     }
 }
 
@@ -200,6 +293,16 @@ impl OcrEngine for TesseractOcr {
         Err(ScannerError::OcrError("OCR support not enabled".to_string()))
     }
     
+    fn process_image_data(&self, image_data: &[u8], format_hint: Option<&str>) -> Result<String> {
+        // Check if initialized
+        if !self.initialized {
+            return Err(ScannerError::OcrError("OCR engine not initialized".to_string()));
+        }
+        
+        warn!("OCR support not enabled. Cannot process image data: {} bytes", image_data.len());
+        Err(ScannerError::OcrError("OCR support not enabled".to_string()))
+    }
+    
     fn cleanup(&self) -> Result<()> {
         Ok(())
     }
@@ -209,37 +312,159 @@ impl OcrEngine for TesseractOcr {
 #[cfg(feature = "ocr")]
 fn preprocess_image_data(img: image::DynamicImage) -> image::DynamicImage {
     use image::{DynamicImage, GenericImageView, Pixel};
+    use imageproc::{contrast, filter, noise, morphology};
     
     // Convert to grayscale
-    let img = img.grayscale();
+    let mut gray_img = img.grayscale();
     
-    // Increase contrast
-    let img = DynamicImage::ImageLuma8(imageproc::contrast::stretch_contrast(&img.to_luma8(), 10, 240));
+    // Take advantage of image dimension to decide the optimal approach
+    let (width, height) = gray_img.dimensions();
+    let is_small_image = width < 800 || height < 800;
     
-    // Perform adaptive threshold
-    let img = DynamicImage::ImageLuma8(imageproc::contrast::adaptive_threshold(&img.to_luma8(), 11));
+    // Get the luma8 image for processing
+    let mut luma_img = gray_img.to_luma8();
     
-    img
+    // Apply some initial denoising only for larger images that might have noise
+    if !is_small_image {
+        // Gentle Gaussian blur to remove noise
+        luma_img = filter::gaussian_blur_f32(&luma_img, 0.75);
+    }
+    
+    // Apply contrast enhancement
+    luma_img = contrast::stretch_contrast(&luma_img, 20, 230);
+    
+    if is_small_image {
+        // For small images, simple binary threshold often works better
+        // Apply binary threshold at a good point for text
+        luma_img = contrast::threshold(&luma_img, 150);
+    } else {
+        // For larger or more complex images, adaptive threshold usually works better
+        luma_img = contrast::adaptive_threshold(&luma_img, 15);
+        
+        // Apply morphological operations to enhance text connection
+        // Useful for broken characters in scanned documents or photos
+        let kernel = morphology::rect_kernel(2, 1);
+        luma_img = morphology::close(&luma_img, &kernel);
+    }
+    
+    // Convert back to DynamicImage
+    DynamicImage::ImageLuma8(luma_img)
 }
 
 /// Preprocess an image file for better OCR results
-pub fn preprocess_image(_image_path: &Path) -> Result<Vec<u8>> {
+pub fn preprocess_image(image_path: &Path) -> Result<Vec<u8>> {
     #[cfg(feature = "ocr")]
     {
+        debug!("Preprocessing image: {}", image_path.display());
+        
+        // Check if file exists and is readable
+        if !image_path.exists() {
+            return Err(ScannerError::OcrError(format!(
+                "Image file does not exist: {}", image_path.display()
+            )));
+        }
+        
+        if !image_path.is_file() {
+            return Err(ScannerError::OcrError(format!(
+                "Path is not a file: {}", image_path.display()
+            )));
+        }
+        
+        // Get the file extension for debugging
+        let extension = image_path.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| "unknown".into());
+        
+        debug!("Processing image of type: {}", extension);
+        
         // Load the image
-        let img = image::open(_image_path)
-            .map_err(|e| ScannerError::OcrError(format!("Failed to open image: {}", e)))?;
+        let img = image::open(image_path)
+            .map_err(|e| ScannerError::OcrError(format!(
+                "Failed to open image {}: {}", image_path.display(), e
+            )))?;
+        
+        // Get original dimensions for logging
+        let (width, height) = img.dimensions();
+        debug!("Original image dimensions: {}x{}", width, height);
         
         // Preprocess the image
         let processed = preprocess_image_data(img);
+        
+        // Get processed dimensions
+        let (proc_width, proc_height) = processed.dimensions();
+        debug!("Processed image dimensions: {}x{}", proc_width, proc_height);
         
         // Create a buffer to hold the processed image
         let mut buffer = Vec::new();
         
         // Write the image to the buffer
         processed.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageOutputFormat::Png)
-            .map_err(|e| ScannerError::OcrError(format!("Failed to write processed image: {}", e)))?;
+            .map_err(|e| ScannerError::OcrError(format!(
+                "Failed to encode processed image: {}", e
+            )))?;
         
+        debug!("Image preprocessing completed: {} bytes", buffer.len());
+        Ok(buffer)
+    }
+    
+    #[cfg(not(feature = "ocr"))]
+    {
+        warn!("Image preprocessing not available without OCR feature enabled");
+        Ok(Vec::new())
+    }
+}
+
+/// Preprocess image data from a buffer
+pub fn preprocess_image_data_from_buffer(image_data: &[u8], format_hint: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(feature = "ocr")]
+    {
+        debug!("Preprocessing image data: {} bytes", image_data.len());
+        
+        // Determine image format
+        let format = match format_hint {
+            Some("jpg") | Some("jpeg") => image::ImageFormat::Jpeg,
+            Some("png") => image::ImageFormat::Png,
+            Some("gif") => image::ImageFormat::Gif,
+            Some("bmp") => image::ImageFormat::Bmp,
+            Some("tiff") => image::ImageFormat::Tiff,
+            _ => {
+                // Try to guess the format from the bytes
+                image::guess_format(image_data)
+                    .map_err(|e| ScannerError::OcrError(format!(
+                        "Failed to determine image format: {}", e
+                    )))?
+            }
+        };
+        
+        debug!("Detected image format: {:?}", format);
+        
+        // Load the image from memory
+        let img = image::load_from_memory_with_format(image_data, format)
+            .map_err(|e| ScannerError::OcrError(format!(
+                "Failed to load image from memory: {}", e
+            )))?;
+        
+        // Get original dimensions for logging
+        let (width, height) = img.dimensions();
+        debug!("Original image dimensions: {}x{}", width, height);
+        
+        // Preprocess the image
+        let processed = preprocess_image_data(img);
+        
+        // Get processed dimensions
+        let (proc_width, proc_height) = processed.dimensions();
+        debug!("Processed image dimensions: {}x{}", proc_width, proc_height);
+        
+        // Create a buffer to hold the processed image
+        let mut buffer = Vec::new();
+        
+        // Write the image to the buffer
+        processed.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageOutputFormat::Png)
+            .map_err(|e| ScannerError::OcrError(format!(
+                "Failed to encode processed image: {}", e
+            )))?;
+        
+        debug!("Image preprocessing completed: {} bytes", buffer.len());
         Ok(buffer)
     }
     

@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 use log::{error, info, LevelFilter};
-use ctrlc;
 
 #[derive(ClapParser)]
 #[command(

@@ -24,7 +24,7 @@ const TEST_MNEMONIC_3: &str = "letter advice cage absurd amount doctor acoustic 
 // Integration test for parser and mnemonic working together
 #[test]
 fn test_bip39_vectors() {
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Test Vector 1
     let words = parser.parse(TEST_MNEMONIC_1).expect("Failed to parse test vector 1");
@@ -43,7 +43,7 @@ fn test_bip39_vectors() {
     assert_eq!(seed.as_bytes()[2], TEST_SEED_1[2]);
     
     // Test creating mnemonic from entropy
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     let mnemonic = Mnemonic::from_entropy(TEST_ENTROPY_1, parser)
         .expect("Failed to create mnemonic from entropy");
     
@@ -102,7 +102,7 @@ fn test_different_wordlists() {
 #[test]
 fn test_entropy_to_mnemonic_to_seed_round_trip() {
     // Create a parser
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Create a mnemonic from entropy
     let mnemonic = Mnemonic::from_entropy(TEST_ENTROPY_2, parser.clone())
@@ -128,7 +128,7 @@ fn test_entropy_to_mnemonic_to_seed_round_trip() {
 // Test invalid inputs
 #[test]
 fn test_invalid_inputs() {
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Test invalid word
     let result = parser.parse("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon INVALID");
@@ -150,7 +150,7 @@ fn test_invalid_inputs() {
 // Test secure string handling
 #[test]
 fn test_secure_string_handling() {
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Create a mnemonic
     let mnemonic = Mnemonic::from_phrase(TEST_MNEMONIC_3, parser)
@@ -562,7 +562,7 @@ fn test_parser_performance() {
     use std::time::Instant;
     
     const ITERATIONS: usize = 1000;
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Test valid mnemonic
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -586,7 +586,7 @@ fn test_parser_performance() {
 #[test]
 fn test_mixed_whitespace_handling() {
     // Test handling of various types of whitespace in mnemonics
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Standard mnemonic
     let standard = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -615,7 +615,7 @@ fn test_wordlist_translation() {
     // by converting indices back to words in a different language
     
     // First, load the English wordlist
-    let english_parser = Parser::default().expect("Failed to create English parser");
+    let english_parser = Parser::create_default().expect("Failed to create English parser");
     
     // Check if Spanish wordlist is available for the test
     let spanish_config = ParserConfig {
@@ -729,7 +729,7 @@ fn test_error_handling() {
     // Test various error cases to ensure they're handled appropriately
     
     // Create a parser
-    let parser = Parser::default().expect("Failed to create parser");
+    let parser = Parser::create_default().expect("Failed to create parser");
     
     // Test empty input
     let result = parser.parse("");

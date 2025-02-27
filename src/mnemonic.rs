@@ -73,7 +73,7 @@ impl Mnemonic {
             224 => 21,
             256 => 24,
             _ => {
-                let valid_sizes = vec![128, 160, 192, 224, 256];
+                let valid_sizes = [128, 160, 192, 224, 256];
                 let expected_bytes = valid_sizes.iter().map(|bits| bits / 8).collect();
                 return Err(MnemonicError::InvalidEntropySize {
                     expected: expected_bytes,
@@ -311,7 +311,7 @@ pub mod benchmarks {
     
     /// Benchmark mnemonic generation with different word counts
     pub fn bench_mnemonic_generation(criterion: &mut criterion::Criterion) {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         
         let mut group = criterion.benchmark_group("mnemonic_generation");
         for &word_count in &[12, 15, 18, 21, 24] {
@@ -324,7 +324,7 @@ pub mod benchmarks {
     
     /// Benchmark seed generation with and without passphrase
     pub fn bench_seed_generation(criterion: &mut criterion::Criterion) {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         let mnemonic = Mnemonic::generate(12, parser).expect("Failed to generate mnemonic");
         
         let mut group = criterion.benchmark_group("seed_generation");
@@ -340,7 +340,7 @@ pub mod benchmarks {
     
     /// Benchmark checksum verification
     pub fn bench_verify_checksum(criterion: &mut criterion::Criterion) {
-        let parser = Parser::default().expect("Failed to create parser");
+        let parser = Parser::create_default().expect("Failed to create parser");
         let mnemonic = Mnemonic::generate(12, parser).expect("Failed to generate mnemonic");
         
         criterion.bench_function("verify_checksum", |b| {
