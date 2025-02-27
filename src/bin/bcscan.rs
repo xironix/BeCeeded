@@ -11,7 +11,7 @@ use beceeded::{
 };
 use clap::{Parser as ClapParser, ValueEnum};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -20,7 +20,7 @@ use std::{
     thread,
     time::Duration,
 };
-use log::{debug, error, info, warn, LevelFilter};
+use log::{error, info, LevelFilter};
 use ctrlc;
 
 #[derive(ClapParser)]
@@ -113,7 +113,7 @@ struct Cli {
     no_logs: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
 enum CliScanMode {
     /// Fast mode - Only processes plain text files, skips OCR/fuzzy/archives 
     /// Fastest option with ~10x speedup over comprehensive, may miss some matches
@@ -351,8 +351,9 @@ fn main() {
     // Start a thread to display progress
     let stats_clone = scanner_stats.clone();
     let mode_str = format!("{:?}", cli.mode);
+    let r_thread = running.clone();
     let stats_thread = thread::spawn(move || {
-        while running.load(Ordering::SeqCst) {
+        while r_thread.load(Ordering::SeqCst) {
             // Display stats
             println!(
                 "[{} Mode] Processed: {} files, {} dirs, {} MB | Rate: {:.2} MB/s | Found: {} phrases, {} ETH keys | Errors: {}",

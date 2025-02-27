@@ -93,11 +93,10 @@ impl Mnemonic {
         bits.extend_from_slice(entropy);
         
         // Calculate checksum by taking the first [checksum_bits] bits of the SHA-256 hash
-        let checksum_byte = {
-            let mut context = Context::new(&SHA256);
-            context.update(entropy);
-            context.finish().as_ref()[0]
-        };
+        let mut context = Context::new(&SHA256);
+        context.update(entropy);
+        let digest = context.finish();
+        let checksum_byte = digest.as_ref()[0];
         
         // Add the checksum byte
         bits.push(checksum_byte);
@@ -106,11 +105,9 @@ impl Mnemonic {
         let mut indices = Vec::with_capacity(word_count);
         for i in 0..word_count {
             let start_bit = i * 11;
-            let mut index: u16 = 0;
-            
             // Fast path for common bit patterns using unsafe for performance
             #[allow(unsafe_code)]
-            unsafe {
+            let index = unsafe {
                 let byte_idx = start_bit / 8;
                 let bit_offset = start_bit % 8;
                 
@@ -119,8 +116,7 @@ impl Mnemonic {
                 let bits_from_first = 8 - bit_offset;
                 let mask = 0xFF >> bit_offset;
                 let contribution = (first_byte & mask) as u16;
-                
-                index = contribution << (11 - bits_from_first);
+                let mut result = contribution << (11 - bits_from_first);
                 
                 // Second byte contribution (always needed for 11 bits)
                 if byte_idx + 1 < bits.len() {
@@ -130,7 +126,7 @@ impl Mnemonic {
                     };
                     
                     if bits_from_second > 0 {
-                        index |= (second_byte >> (8 - bits_from_second)) as u16;
+                        result |= (second_byte >> (8 - bits_from_second)) as u16;
                     }
                 }
                 
@@ -142,10 +138,12 @@ impl Mnemonic {
                     if bits_from_third > 0 {
                         let mask = 0xFF << (8 - bits_from_third);
                         let contribution = (third_byte & mask) as u16;
-                        index |= contribution >> (8 - bits_from_third);
+                        result |= contribution >> (8 - bits_from_third);
                     }
                 }
-            }
+                
+                result
+            };
             
             indices.push(index);
         }
