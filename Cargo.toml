@@ -1,0 +1,44 @@
+[package]
+name = "beceeded"
+version = "0.1.0"
+edition = "2021"
+authors = ["BeCeeded Team"]
+description = "A Rust implementation of ceed_parser, A high-performance tool for parsing and validating cryptocurrency seed phrases, mnemonics, and wallets."
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+# Core functionality
+ring = "0.17.11"                # Cryptographic operations (replacement for OpenSSL)
+thiserror = "2.0.11"           # Error handling - latest version
+log = "0.4.26"                 # Logging interface
+env_logger = "0.11.6"          # Logging implementation
+rayon = "1.10.0"                # Parallel processing (replacement for thread_pool)
+serde = { version = "1.0.218", features = ["derive"] } # Serialization/deserialization
+serde_json = "1.0.139"         # JSON support
+clap = { version = "4.5.3", features = ["derive"] } # Command line argument parsing
+hex = "0.4.3"                  # Hex encoding/decoding
+
+# Memory and security
+zeroize = { version = "1.8.1", features = ["derive"] } # Secure memory zeroing with derive feature
+secrecy = "0.10.3"              # Handling sensitive data - specified version
+
+[dev-dependencies]
+# We use criterion solely for benchmarking, not testing
+criterion = "0.5.1"            # Benchmarking
+
+# Standard Rust testing framework is used for unit tests
+# PropTest is used when we need property-based testing
+proptest = "1.6.0"             # Property-based testing with stochastic inputs
+tempfile = "3.17.1"            # Temporary file handling for tests
+
+[[bench]]
+name = "parser_benchmark"
+harness = false
+
+[profile.release]
+lto = true                     # Link-time optimization
+codegen-units = 1              # Slower compile, better optimization
+panic = "abort"                # Smaller binary size
+strip = true                   # Strip symbols from binary
+debug = false                  # No debug symbols

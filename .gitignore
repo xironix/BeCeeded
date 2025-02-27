@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file (uncomment if developing a library)
+# Cargo.lock
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*~
+\#*\#
+.\#*
+*.bak
+*.iml
+
+# Debug artifacts and binaries
+*.profraw
+*.gcda
+*.gcno
+*.exe
+*.dll
+*.so
+*.dylib
+# Rust debug fingerprints
+**/.fingerprint/
+
+# Testing and benchmarking
+/criterion/
+benchmark-output/
+/coverage/
+/corpus/
+/crashes/
+
+# Generated documentation
+/doc/
+/docs/ 
