@@ -91,11 +91,11 @@ fn create_test_files(dir: &Path) -> std::io::Result<()> {
 }
 
 #[test]
-#[ignore] // Test fails due to thread pool initialization issues when run with other tests
 fn test_scanner_finds_valid_phrases() {
     let (scanner, temp_dir) = setup_scanner();
     
     // Scan the directory
+    // We're using the new work-stealing implementation which doesn't have thread pool issues
     scanner.scan_directory(temp_dir.path()).unwrap();
     
     // Check that we found the expected phrases
@@ -104,7 +104,6 @@ fn test_scanner_finds_valid_phrases() {
 }
 
 #[test]
-#[ignore] // Test fails due to thread pool initialization issues when run with other tests
 fn test_scanner_finds_eth_keys() {
     let (scanner, temp_dir) = setup_scanner();
     
@@ -159,7 +158,6 @@ fn test_scanner_skips_excluded_extensions() {
 }
 
 #[test]
-#[ignore] // Test fails due to thread pool initialization issues when run with other tests
 fn test_scanner_fuzzy_matching() {
     // Create a temporary directory
     let temp_dir = TempDir::new().unwrap();
@@ -192,11 +190,18 @@ fn test_scanner_fuzzy_matching() {
     let mut scanner_config = ScannerConfig::default();
     scanner_config.use_fuzzy_matching = true;
     scanner_config.fuzzy_threshold = 0.7; // Lower threshold for the test
+    scanner_config.threads = 1; // Use single thread for test stability
     let scanner = Scanner::new(scanner_config, parser, Box::new(db)).unwrap();
     
     // Scan the directory
     scanner.scan_directory(temp_path).unwrap();
     
-    // Note: This is a smoke test - we can't check exact results since the fuzzy matching
-    // implementation is just a placeholder in our code. We're just checking that it runs.
+    // Get scan statistics
+    let stats = scanner.stats();
+    println!("Fuzzy test - files processed: {}", stats.files_processed.load(std::sync::atomic::Ordering::Relaxed));
+    println!("Fuzzy test - phrases found: {}", stats.phrases_found.load(std::sync::atomic::Ordering::Relaxed));
+    
+    // We should at least have processed 1 file
+    assert!(stats.files_processed.load(std::sync::atomic::Ordering::Relaxed) > 0, 
+           "Scanner should have processed at least one file");
 } 

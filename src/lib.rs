@@ -12,6 +12,7 @@ pub mod logger;
 pub mod scanner;
 pub mod db;
 pub mod ocr;
+pub mod interactive;
 
 // Public re-exports
 pub use parser::{Parser, ParserConfig, ParserError};

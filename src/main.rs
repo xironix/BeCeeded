@@ -38,6 +38,10 @@ struct Cli {
     /// Which wordlist to use
     #[arg(short, long, value_name = "NAME", default_value = "english")]
     wordlist: String,
+    
+    /// Use interactive CLI mode
+    #[arg(short, long)]
+    interactive: bool,
 
     /// Subcommand to execute
     #[command(subcommand)]
@@ -93,7 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create parser
     let parser = Parser::new(cli.wordlist_dir, cli.wordlist.clone(), config)?;
 
-    // Execute subcommand
+    // Check if interactive mode was requested
+    if cli.interactive {
+        // Launch interactive CLI
+        use beceeded::interactive::InteractiveCli;
+        let interactive_cli = InteractiveCli::new();
+        return interactive_cli.run();
+    }
+
+    // Execute subcommand in standard mode
     match &cli.command {
         Commands::Generate { words } => {
             // Generate a new mnemonic

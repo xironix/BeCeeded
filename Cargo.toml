@@ -14,9 +14,16 @@ thiserror = "2.0.11"           # Error handling - latest version
 log = "0.4.26"                 # Logging interface
 env_logger = "0.11.6"          # Logging implementation
 rayon = "1.10.0"                # Parallel processing (replacement for thread_pool)
+crossbeam = "0.8.4"            # Work-stealing queue and thread coordination 
+crossbeam-utils = "0.8.19"     # Utilities for crossbeam
+crossbeam-channel = "0.5.11"   # Multi-producer multi-consumer channels
+crossbeam-deque = "0.8.4"      # Work-stealing deque
 serde = { version = "1.0.218", features = ["derive"] } # Serialization/deserialization
 serde_json = "1.0.139"         # JSON support
 clap = { version = "4.5.3", features = ["derive"] } # Command line argument parsing
+dialoguer = "0.11.0"           # Interactive CLI dialogues
+console = "0.15.8"             # Terminal and console utilities
+indicatif = "0.17.8"           # Progress indicators for CLI applications
 hex = "0.4.3"                  # Hex encoding/decoding
 unicode-normalization = "0.1.23"  # Unicode normalization (NFKD for mnemonic phrases)
 
@@ -48,6 +55,9 @@ num_cpus = "1.16.0"             # CPU count detection for parallel processing
 ctrlc = "3.4.4"                 # Signal handling for graceful shutdown
 strsim = "0.11.0"               # String similarity for fuzzy matching
 regex = "1.10.3"                # Regular expressions for pattern matching
+bloom = "0.3.2"                 # Bloom filter for memory-efficient set operations
+ahash = "0.8.11"                # Fast, cross-platform hashing functions
+twox-hash = "1.6.3"             # Another fast hashing implementation
 
 # Document format support
 zip = { version = "2.2.3", optional = true }      # ZIP file processing
@@ -101,3 +111,5 @@ archive = ["dep:zip"]
 encrypted_db = []
 # Add criterion as an optional dependency
 criterion = []
+# Add test utilities for external testing
+test-utils = []

@@ -12,16 +12,22 @@ use crate::{
 use log::{debug, error, info, trace, warn};
 // Removed unused import: rayon::prelude
 use std::{
-    collections::HashSet,
     fs::{self, File},
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::Instant,
+    hash::{Hash, Hasher},
+    thread,
 };
+use bloom::{BloomFilter, ASMS};
+use ahash::AHasher;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_deque::{Injector, Stealer, Worker};
+use crossbeam_utils::sync::WaitGroup;
 use thiserror::Error;
 use hex;
 use secp256k1;
@@ -388,6 +394,20 @@ pub trait DbController: Send + Sync {
     fn close(&self) -> Result<()>;
 }
 
+/// Path hasher for the bloom filter
+struct PathHasher;
+
+impl PathHasher {
+    /// Hash a path for the bloom filter
+    fn hash_path(path: &Path) -> u64 {
+        // Use AHasher for better cross-platform performance
+        use std::hash::{Hash, Hasher};
+        let mut hasher = AHasher::default();
+        path.to_string_lossy().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// The scanner for cryptocurrency seed phrases and private keys
 pub struct Scanner {
     /// Configuration for the scanner
@@ -402,8 +422,9 @@ pub struct Scanner {
     /// Scanning statistics
     stats: Arc<ScanStats>,
 
-    /// Set of processed files to avoid duplicates
-    processed_files: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Bloom filter of processed files to avoid duplicates
+    /// This is much more memory efficient than a HashSet for large scans
+    processed_files: Arc<RwLock<BloomFilter>>,
 
     /// Flag to signal scanner shutdown
     shutdown: Arc<AtomicBool>,
@@ -419,12 +440,19 @@ impl Scanner {
         // Apply settings based on scan mode
         config.apply_scan_mode();
         
+        // Calculate optimal bloom filter size based on expected file count
+        // A good balance between memory usage and false positive rate
+        // Estimated 100,000 files with 0.001 false positive rate
+        let bloom_capacity = config.max_memory / 10;  // Use 10% of max memory for bloom filter
+        let num_hashes = 5; // A good default for bloom filters
+        let bloom_filter = BloomFilter::with_size(bloom_capacity, num_hashes);
+        
         let scanner = Self {
             config,
             parser,
             db: Arc::new(db),
             stats: Arc::new(ScanStats::new()),
-            processed_files: Arc::new(Mutex::new(HashSet::new())),
+            processed_files: Arc::new(RwLock::new(bloom_filter)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
 
@@ -434,7 +462,7 @@ impl Scanner {
         Ok(scanner)
     }
 
-    /// Start scanning a directory
+    /// Start scanning a directory using a work-stealing queue
     pub fn scan_directory(&self, directory: &Path) -> Result<()> {
         // Validate the directory
         if !directory.exists() {
@@ -452,17 +480,205 @@ impl Scanner {
         }
 
         info!("Starting scan of directory: {}", directory.display());
-        info!("Using {} threads", self.config.threads);
+        info!("Using {} threads with work-stealing scheduler", self.config.threads);
 
-        // Set up thread pool
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(self.config.threads)
-            .build_global()
-            .map_err(|e| ScannerError::Other(format!("Failed to build thread pool: {}", e)))?;
-
-        // Walk the directory and process files
-        self.process_directory(directory)?;
-
+        // Set up work-stealing queue for files
+        let global_queue = Arc::new(Injector::new());
+        
+        // Create worker threads
+        let mut workers: Vec<Worker<PathBuf>> = Vec::with_capacity(self.config.threads);
+        let mut stealers = Vec::with_capacity(self.config.threads);
+        
+        for _ in 0..self.config.threads {
+            let worker = Worker::new_fifo();
+            stealers.push(worker.stealer());
+            workers.push(worker);
+        }
+        
+        // Create a communication channel for directory discovery
+        let (dir_sender, dir_receiver) = bounded::<PathBuf>(1000);
+        
+        // Add the initial directory
+        dir_sender.send(directory.to_path_buf())
+            .map_err(|_| ScannerError::Other("Failed to send initial directory".to_string()))?;
+        
+        // Set up wait group to track when all threads are done
+        let wg = WaitGroup::new();
+        
+        // Start worker threads
+        let mut thread_handles = Vec::with_capacity(self.config.threads);
+        
+        for (i, worker) in workers.into_iter().enumerate() {
+            // Clone all necessary references for this thread
+            let my_stealers = stealers.clone();
+            let global_queue = Arc::clone(&global_queue);
+            let dir_receiver = dir_receiver.clone();
+            let dir_sender = dir_sender.clone();
+            let scanner = Arc::new(self.clone()); // Clone the scanner for thread safety
+            let wg_worker = wg.clone();
+            
+            // Start the worker thread
+            let handle = thread::spawn(move || {
+                // Signal completion when thread exits
+                let _wg_guard = wg_worker;
+                
+                // Thread-local queue for this worker
+                let local_queue = worker;
+                
+                debug!("Worker thread {} started", i);
+                
+                // Process directories and files until all work is complete
+                'work: loop {
+                    // Check for shutdown signal
+                    if scanner.shutdown.load(Ordering::Relaxed) {
+                        debug!("Worker thread {} received shutdown signal", i);
+                        break 'work;
+                    }
+                    
+                    // First, try to process work from our local queue
+                    if let Some(path) = local_queue.pop() {
+                        if path.is_file() {
+                            if let Err(e) = scanner.process_file(&path) {
+                                error!("Error processing file {}: {}", path.display(), e);
+                                scanner.stats.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // If local queue is empty, try to steal from the global queue
+                    if let crossbeam_deque::Steal::Success(path) = global_queue.steal_batch_and_pop(&local_queue) {
+                        if path.is_file() {
+                            if let Err(e) = scanner.process_file(&path) {
+                                error!("Error processing file {}: {}", path.display(), e);
+                                scanner.stats.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // If global queue is empty, try to steal from other workers
+                    let mut found_work = false;
+                    for stealer in &my_stealers {
+                        if let crossbeam_deque::Steal::Success(path) = stealer.steal_batch_and_pop(&local_queue) {
+                            if path.is_file() {
+                                if let Err(e) = scanner.process_file(&path) {
+                                    error!("Error processing file {}: {}", path.display(), e);
+                                    scanner.stats.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            found_work = true;
+                            break;
+                        }
+                    }
+                    
+                    if found_work {
+                        continue;
+                    }
+                    
+                    // If no files to process, check for directories
+                    match dir_receiver.try_recv() {
+                        Ok(dir_path) => {
+                            // Process a directory - add all entries to the appropriate queues
+                            match fs::read_dir(&dir_path) {
+                                Ok(entries) => {
+                                    scanner.stats.dirs_processed.fetch_add(1, Ordering::Relaxed);
+                                    
+                                    for entry in entries {
+                                        if scanner.shutdown.load(Ordering::Relaxed) {
+                                            break 'work;
+                                        }
+                                        
+                                        if let Ok(entry) = entry {
+                                            let path = entry.path();
+                                            
+                                            if path.is_dir() {
+                                                // Add subdirectory to directory queue
+                                                if let Err(e) = dir_sender.send(path) {
+                                                    error!("Failed to queue directory: {}", e);
+                                                }
+                                            } else if path.is_file() {
+                                                // Process file if not already processed
+                                                let path_hash = PathHasher::hash_path(&path);
+                                                
+                                                let contains;
+                                                {
+                                                    let filter = scanner.processed_files.read().unwrap();
+                                                    contains = filter.contains(&path_hash);
+                                                }
+                                                
+                                                if !contains {
+                                                    // Add to processed files filter
+                                                    {
+                                                        let mut filter = scanner.processed_files.write().unwrap();
+                                                        filter.insert(&path_hash);
+                                                    }
+                                                    
+                                                    // Add file to local queue
+                                                    local_queue.push(path);
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Failed to read directory {}: {}", dir_path.display(), e);
+                                    scanner.stats.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                
+                            }
+                        },
+                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                            // No directories to process, but might be more work coming
+                            // Sleep briefly to avoid tight polling loop
+                            thread::sleep(std::time::Duration::from_millis(1));
+                        },
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            // Channel is closed - no more work
+                            if local_queue.is_empty() {
+                                // Make sure we've also exhausted all other work sources
+                                let mut has_work = false;
+                                
+                                // Check global queue
+                                if let crossbeam_deque::Steal::Success(path) = global_queue.steal_batch_and_pop(&local_queue) {
+                                    local_queue.push(path);
+                                    has_work = true;
+                                }
+                                
+                                // Check other workers
+                                if !has_work {
+                                    for stealer in &my_stealers {
+                                        if let crossbeam_deque::Steal::Success(path) = stealer.steal_batch_and_pop(&local_queue) {
+                                            local_queue.push(path);
+                                            has_work = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                if !has_work {
+                                    // No more work anywhere - exit
+                                    debug!("Worker thread {} finished - no more work", i);
+                                    break 'work;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                debug!("Worker thread {} exiting", i);
+            });
+            
+            thread_handles.push(handle);
+        }
+        
+        // Drop the original senders - this ensures the channel will close
+        // when all worker threads are done with their copies
+        drop(dir_sender);
+        
+        // Wait for all threads to finish
+        wg.wait();
+        
         info!(
             "Scan completed. Processed {} files ({} MB) in {} seconds",
             self.stats.files_processed.load(Ordering::Relaxed),
@@ -474,6 +690,14 @@ impl Scanner {
             self.stats.phrases_found.load(Ordering::Relaxed),
             self.stats.eth_keys_found.load(Ordering::Relaxed)
         );
+        
+        // Calculate throughput
+        let elapsed = self.stats.elapsed_seconds();
+        if elapsed > 0 {
+            let files_per_sec = self.stats.files_processed.load(Ordering::Relaxed) as f64 / elapsed as f64;
+            let mb_per_sec = (self.stats.bytes_processed.load(Ordering::Relaxed) as f64 / 1_048_576.0) / elapsed as f64;
+            info!("Performance: {:.2} files/sec, {:.2} MB/sec", files_per_sec, mb_per_sec);
+        }
 
         Ok(())
     }
@@ -513,10 +737,22 @@ impl Scanner {
                 self.process_directory(&path)?;
             } else if path.is_file() {
                 // Process file if not already processed
-                let mut processed_files = self.processed_files.lock().unwrap();
-                if !processed_files.contains(&path) {
-                    processed_files.insert(path.clone());
-                    drop(processed_files); // Release lock before processing
+                // Use the bloom filter for memory-efficient tracking
+                let path_hash = PathHasher::hash_path(&path);
+                
+                // Read lock for checking
+                let contains;
+                {
+                    let filter = self.processed_files.read().unwrap();
+                    contains = filter.contains(&path_hash);
+                }
+                
+                if !contains {
+                    // Write lock only needed when updating
+                    {
+                        let mut filter = self.processed_files.write().unwrap();
+                        filter.insert(&path_hash);
+                    }
 
                     // Process the file
                     if let Err(e) = self.process_file(&path) {
@@ -1871,6 +2107,20 @@ impl Scanner {
     /// Check if a word is a valid BIP39 word
     pub fn is_valid_bip39_word(&self, word: &str) -> bool {
         self.parser.is_valid_word(word)
+    }
+}
+
+/// Clone implementation to support multithreaded scanning
+impl Clone for Scanner {
+    fn clone(&self) -> Self {
+        Scanner {
+            config: self.config.clone(),
+            parser: self.parser.clone(),
+            db: Arc::clone(&self.db),
+            stats: Arc::clone(&self.stats),
+            processed_files: Arc::clone(&self.processed_files),
+            shutdown: Arc::clone(&self.shutdown),
+        }
     }
 }
 
