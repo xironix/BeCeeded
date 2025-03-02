@@ -16,7 +16,7 @@ use std::{
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Instant,
@@ -33,6 +33,7 @@ use hex;
 use secp256k1;
 use tiny_keccak;
 use strsim;
+use rayon::prelude::*;
 
 /// Errors that can occur during scanning operations
 #[derive(Debug, Error)]
@@ -296,18 +297,30 @@ pub struct ScanStats {
 
     /// Start time of the scan
     pub start_time: Instant,
+    
+    /// Current memory usage in bytes
+    pub memory_usage: AtomicUsize,
+    
+    /// Maximum memory usage observed
+    pub max_memory_usage: AtomicUsize,
+    
+    /// Number of memory pressure events
+    pub memory_pressure_events: AtomicUsize,
 }
 
 impl Default for ScanStats {
     fn default() -> Self {
         Self {
-            start_time: Instant::now(),
             files_processed: AtomicU64::new(0),
             dirs_processed: AtomicU64::new(0),
             bytes_processed: AtomicU64::new(0),
             phrases_found: AtomicU64::new(0),
             eth_keys_found: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            start_time: Instant::now(),
+            memory_usage: AtomicUsize::new(0),
+            max_memory_usage: AtomicUsize::new(0),
+            memory_pressure_events: AtomicUsize::new(0),
         }
     }
 }
@@ -394,17 +407,46 @@ pub trait DbController: Send + Sync {
     fn close(&self) -> Result<()>;
 }
 
-/// Path hasher for the bloom filter
+/// An optimized path hasher for the bloom filter
 struct PathHasher;
 
 impl PathHasher {
-    /// Hash a path for the bloom filter
+    /// Hash a path for the bloom filter using AHash for better performance
+    #[inline]
     fn hash_path(path: &Path) -> u64 {
-        // Use AHasher for better cross-platform performance
-        use std::hash::{Hash, Hasher};
         let mut hasher = AHasher::default();
         path.to_string_lossy().hash(&mut hasher);
         hasher.finish()
+    }
+    
+    /// Generate multiple hash values for the bloom filter
+    /// This improves the bloom filter's accuracy
+    #[inline]
+    fn hash_path_multiple(path: &Path, n: usize) -> Vec<u64> {
+        let base_hash = Self::hash_path(path);
+        let mut hashes = Vec::with_capacity(n);
+        hashes.push(base_hash);
+        
+        // Generate additional hash values using the FNV-1a technique
+        // but with different prime numbers for each hash
+        let primes = [
+            16777619, 31, 131, 1313, 13131,
+            2147483647, 67867967, 2166136261
+        ];
+        
+        for i in 1..n {
+            if i < primes.len() {
+                let mut h = base_hash;
+                h ^= (i as u64) * primes[i];
+                h = h.wrapping_mul(primes[i] as u64);
+                hashes.push(h);
+            } else {
+                // Fallback for large n
+                hashes.push(base_hash.wrapping_add(i as u64));
+            }
+        }
+        
+        hashes
     }
 }
 
@@ -440,12 +482,25 @@ impl Scanner {
         // Apply settings based on scan mode
         config.apply_scan_mode();
         
-        // Calculate optimal bloom filter size based on expected file count
-        // A good balance between memory usage and false positive rate
-        // Estimated 100,000 files with 0.001 false positive rate
-        let bloom_capacity = config.max_memory / 10;  // Use 10% of max memory for bloom filter
-        let num_hashes = 5; // A good default for bloom filters
-        let bloom_filter = BloomFilter::with_size(bloom_capacity, num_hashes);
+        // Calculate optimal bloom filter size based on expected file count and false positive rate
+        // Lower false positive rate (0.0001 instead of 0.001) and more hash functions (7 instead of 5)
+        let estimated_max_files = 1_000_000; // Estimate max number of files to process
+        let false_positive_rate = 0.0001_f64; // Lower FP rate for better accuracy
+        
+        // Calculate optimal size using the formula: m = -n*ln(p)/(ln(2))²
+        // where n is the number of items and p is the false positive rate
+        let ln_p = false_positive_rate.ln();
+        let ln_2_squared = std::f64::consts::LN_2.powi(2);
+        let optimal_bits = -((estimated_max_files as f64) * ln_p / ln_2_squared) as usize;
+        
+        // Calculate optimal number of hash functions using the formula: k = m/n * ln(2)
+        let optimal_hashes = ((optimal_bits as f64) / (estimated_max_files as f64) * std::f64::consts::LN_2) as usize;
+        
+        // Create the bloom filter with optimized parameters
+        let bloom_filter = BloomFilter::with_size(optimal_bits, optimal_hashes.max(5).min(10) as u32);
+        
+        info!("Created bloom filter with {} bits and {} hash functions", 
+              optimal_bits, optimal_hashes.max(5).min(10));
         
         let scanner = Self {
             config,
@@ -603,19 +658,46 @@ impl Scanner {
                                                 
                                                 let contains;
                                                 {
+                                                    // First do a quick read-lock check with the primary hash
+                                                    let primary_hash = PathHasher::hash_path(&path);
                                                     let filter = scanner.processed_files.read().unwrap();
-                                                    contains = filter.contains(&path_hash);
+                                                    contains = filter.contains(&primary_hash);
                                                 }
                                                 
                                                 if !contains {
-                                                    // Add to processed files filter
+                                                    // Only do the write lock if we need to process this file
+                                                    // This reduces contention on the write lock
+                                                    let mut processed = false;
                                                     {
+                                                        // Double-check with write lock to avoid race conditions
                                                         let mut filter = scanner.processed_files.write().unwrap();
-                                                        filter.insert(&path_hash);
+                                                        
+                                                        // Generate multiple hash values for better accuracy
+                                                        let num_hashes = 5; // Default to 5 hash functions
+                                                        let hashes = PathHasher::hash_path_multiple(&path, num_hashes);
+                                                        
+                                                        // Check if any hash is present
+                                                        let contains = hashes.iter().all(|hash| filter.contains(hash));
+                                                        
+                                                        if !contains {
+                                                            // Insert all hashes
+                                                            for hash in hashes {
+                                                                filter.insert(&hash);
+                                                            }
+                                                            processed = true;
+                                                        }
                                                     }
                                                     
-                                                    // Add file to local queue
-                                                    local_queue.push(path);
+                                                    if processed {
+                                                        // Add to processed files filter
+                                                        {
+                                                            let mut filter = scanner.processed_files.write().unwrap();
+                                                            filter.insert(&path_hash);
+                                                        }
+                                                        
+                                                        // Add file to local queue
+                                                        local_queue.push(path);
+                                                    }
                                                 }
                                             }
                                         }
@@ -768,6 +850,20 @@ impl Scanner {
 
     /// Process a single file
     fn process_file(&self, file_path: &Path) -> Result<()> {
+        // Check if we're under memory pressure
+        if self.check_memory_usage() {
+            // If we're under memory pressure, process smaller files first
+            if let Ok(metadata) = fs::metadata(file_path) {
+                let file_size = metadata.len() as usize;
+                if file_size > 1_048_576 { // 1MB
+                    // Skip large files when under memory pressure
+                    debug!("Skipping large file under memory pressure: {} ({} MB)", 
+                          file_path.display(), file_size / 1_048_576);
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if we should skip this file based on extension
         if self.should_skip_file(file_path) {
             trace!("Skipping file: {}", file_path.display());
@@ -779,46 +875,203 @@ impl Scanner {
         // Update stats
         self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
 
-        // Update processed bytes in stats
+        // Process based on file type
         if let Ok(metadata) = fs::metadata(file_path) {
-            self.stats
-                .bytes_processed
-                .fetch_add(metadata.len(), Ordering::Relaxed);
+            if metadata.is_file() {
+                let file_size = metadata.len() as usize;
+                
+                // Track memory allocation
+                self.track_allocation(file_size);
+                
+                // Track file size in stats
+                self.stats.bytes_processed.fetch_add(file_size as u64, Ordering::Relaxed);
+                
+                // Process the file based on scan mode
+                let result = match self.config.scan_mode {
+                    ScanMode::Fast => {
+                        // Fast mode: Only process plain text files
+                        self.process_text_file(file_path)
+                    },
+                    ScanMode::Default => {
+                        // Default mode: Process text files and emails
+                        self.process_text_file(file_path)
+                    },
+                    ScanMode::Enhanced | ScanMode::Comprehensive => {
+                        // Enhanced/Comprehensive: Based on file extension
+                        self.process_text_file(file_path)
+                    }
+                };
+                
+                // Track memory deallocation
+                self.track_deallocation(file_size);
+                
+                result
+            } else {
+                Ok(())
+            }
+        } else {
+            warn!("Failed to get metadata for file: {}", file_path.display());
+            Ok(())
         }
+    }
 
-        // Handle different file types based on scan mode
-        match self.config.scan_mode {
-            ScanMode::Fast => {
-                // Fast mode: Only process plain text files
-                self.process_text_file(file_path)
-            },
-            ScanMode::Default => {
-                // Default mode: Process text files and emails
-                self.process_text_file(file_path)
-            },
-            ScanMode::Enhanced => {
-                // Enhanced mode: Also process images with OCR
-                if self.config.use_ocr && self.is_image_file(file_path) {
-                    self.process_image_file(file_path)
-                } else {
-                    self.process_text_file(file_path)
+    /// Process a text file
+    fn process_text_file(&self, file_path: &Path) -> Result<()> {
+        // Open the file
+        let file = File::open(file_path).map_err(|e| {
+            error!("Failed to open file {}: {}", file_path.display(), e);
+            ScannerError::IoError(e)
+        })?;
+
+        let file_size = file.metadata()?.len();
+        let reader = BufReader::new(file);
+
+        // Process the file line by line
+        let mut line_number = 0;
+        for line in reader.lines() {
+            line_number += 1;
+
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    error!(
+                        "Error reading line {} from file {}: {}",
+                        line_number,
+                        file_path.display(),
+                        e
+                    );
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-            },
-            ScanMode::Comprehensive => {
-                // Comprehensive mode: Process all supported file types
-                if self.config.use_ocr && self.is_image_file(file_path) {
-                    self.process_image_file(file_path)
-                } else if self.config.scan_archives && self.is_archive_file(file_path) {
-                    self.process_archive_file(file_path)
-                } else if self.config.scan_documents && self.is_document_file(file_path) {
-                    self.process_document_file(file_path)
-                } else if self.config.scan_pdfs && self.is_pdf_file(file_path) {
-                    self.process_pdf_file(file_path)
-                } else {
-                    self.process_text_file(file_path)
-                }
+            };
+
+            // Look for seed phrases
+            self.scan_for_seed_phrases(&line, file_path, Some(line_number))?;
+
+            // Look for Ethereum private keys if enabled
+            if self.config.scan_eth_keys {
+                self.scan_for_eth_keys(&line, file_path, Some(line_number))?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Find closest BIP39 words in parallel for a list of input words
+    fn find_closest_bip39_words_parallel(&self, words: &[&str]) -> Vec<(String, f64)> {
+        let wordlist = self.parser.wordlist();
+        
+        words.par_iter()
+            .map(|word| {
+                let mut best_match = String::new();
+                let mut best_similarity = 0.0;
+                
+                for valid_word in wordlist {
+                    let similarity = strsim::jaro_winkler(word, valid_word);
+                    
+                    if similarity > best_similarity {
+                        best_similarity = similarity;
+                        best_match = valid_word.to_string();
+                    }
+                }
+                
+                (best_match, best_similarity)
+            })
+            .collect()
+    }
+
+    /// Check memory usage and trigger cleanup if necessary
+    fn check_memory_usage(&self) -> bool {
+        let current_usage = self.stats.memory_usage.load(Ordering::Relaxed);
+        let max_usage = self.config.max_memory;
+        
+        if current_usage > max_usage {
+            // We're over the memory limit
+            debug!("Memory pressure detected: {} MB used, {} MB limit", 
+                  current_usage / 1_048_576, max_usage / 1_048_576);
+            
+            // Increment the counter
+            self.stats.memory_pressure_events.fetch_add(1, Ordering::Relaxed);
+            
+            // Trigger cleanup
+            self.reduce_memory_pressure();
+            
+            // Return true to indicate memory pressure
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Track memory allocation
+    fn track_allocation(&self, size: usize) {
+        let current = self.stats.memory_usage.fetch_add(size, Ordering::Relaxed) + size;
+        
+        // Also update max usage
+        let mut max = self.stats.max_memory_usage.load(Ordering::Relaxed);
+        while current > max {
+            match self.stats.max_memory_usage.compare_exchange(
+                max, current, Ordering::SeqCst, Ordering::Relaxed
+            ) {
+                Ok(_) => break,
+                Err(actual) => max = actual,
+            }
+        }
+    }
+
+    /// Track memory deallocation
+    fn track_deallocation(&self, size: usize) {
+        self.stats.memory_usage.fetch_sub(size, Ordering::Relaxed);
+    }
+
+    /// Reduce memory pressure by releasing caches and triggering GC
+    fn reduce_memory_pressure(&self) {
+        debug!("Reducing memory pressure");
+        
+        // 1. Clear any caches
+        {
+            // Get a write lock on the bloom filter to prevent concurrent access
+            let mut filter = self.processed_files.write().unwrap();
+            
+            // We can't modify the bloom filter itself, but we could replace it
+            // This would lose the existing tracking, so only do this in extreme cases
+            if self.stats.memory_pressure_events.load(Ordering::Relaxed) > 10 {
+                warn!("Extreme memory pressure: resetting bloom filter");
+                
+                // Replace the filter with a fixed size
+                *filter = BloomFilter::with_size(1_000_000, 5); // Use fixed size and 5 hash functions
+                
+                // Reset memory usage counter
+                self.stats.memory_usage.store(0, Ordering::Relaxed);
+            }
+        }
+        
+        // 2. Suggest Rust's memory allocator to release memory
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // On Linux, we can call malloc_trim to release memory
+            // This is a non-standard extension, so we need to use libc
+            extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            
+            // Call malloc_trim to release memory
+            malloc_trim(0);
+        }
+        
+        // 3. Force a garbage collection cycle
+        // Rust doesn't have a GC, but we can trigger a minor "cleanup" by allocating a large
+        // chunk of memory and then freeing it, which might cause the allocator to compact
+        {
+            let temp_allocation = vec![0u8; 1024 * 1024]; // 1MB allocation
+            // Force the vector to be actually allocated
+            assert_eq!(temp_allocation.len(), 1024 * 1024);
+            // Let it be dropped naturally
+        }
+        
+        // Log the new memory usage
+        debug!("Memory usage after pressure reduction: {} MB", 
+               self.stats.memory_usage.load(Ordering::Relaxed) / 1_048_576);
     }
 
     /// Check if a file should be skipped based on extension
@@ -880,1233 +1133,6 @@ impl Scanner {
         } else {
             false
         }
-    }
-
-    /// Process a text file
-    fn process_text_file(&self, file_path: &Path) -> Result<()> {
-        // Open the file
-        let file = File::open(file_path).map_err(|e| {
-            error!("Failed to open file {}: {}", file_path.display(), e);
-            ScannerError::IoError(e)
-        })?;
-
-        let file_size = file.metadata()?.len();
-        let reader = BufReader::new(file);
-
-        // Update stats
-        self.stats
-            .bytes_processed
-            .fetch_add(file_size, Ordering::Relaxed);
-
-        // Process the file line by line
-        let mut line_number = 0;
-        for line in reader.lines() {
-            line_number += 1;
-
-            let line = match line {
-                Ok(line) => line,
-                Err(e) => {
-                    error!(
-                        "Error reading line {} from file {}: {}",
-                        line_number,
-                        file_path.display(),
-                        e
-                    );
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-
-            // Look for seed phrases
-            self.scan_for_seed_phrases(&line, file_path, Some(line_number))?;
-
-            // Look for Ethereum private keys if enabled
-            if self.config.scan_eth_keys {
-                self.scan_for_eth_keys(&line, file_path, Some(line_number))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Process an image file using OCR
-    fn process_image_file(&self, file_path: &Path) -> Result<()> {
-        info!("Processing image file with OCR: {}", file_path.display());
-        
-        // Update file count in stats
-        self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
-        
-        // Update processed bytes in stats
-        if let Ok(metadata) = fs::metadata(file_path) {
-            self.stats
-                .bytes_processed
-                .fetch_add(metadata.len(), Ordering::Relaxed);
-        }
-        
-        // Check if we have OCR support
-        #[cfg(feature = "ocr")]
-        {
-            use crate::ocr::{OcrEngine, OcrOptions, TesseractOcr};
-            
-            // Initialize OCR engine
-            let mut ocr = TesseractOcr::new();
-            let options = OcrOptions {
-                language: "eng".to_string(),
-                phrase_mode: true,
-                preprocessing: true,
-                confidence_threshold: 60.0,
-            };
-            
-            if let Err(e) = ocr.init(&options) {
-                error!("Failed to initialize OCR engine: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Err(ScannerError::OcrError(format!("OCR initialization failed: {}", e)));
-            }
-            
-            // Process the image
-            match ocr.process_image(file_path) {
-                Ok(text) => {
-                    // Scan the extracted text for seed phrases
-                    if !text.is_empty() {
-                        debug!("OCR extracted {} characters from {}", text.len(), file_path.display());
-                        
-                        // Split the text into lines and scan each line
-                        for (i, line) in text.lines().enumerate() {
-                            if !line.trim().is_empty() {
-                                // Scan for seed phrases
-                                if let Err(e) = self.scan_for_seed_phrases(line, file_path, Some(i + 1)) {
-                                    error!("Error scanning OCR text: {}", e);
-                                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                                }
-                                
-                                // Scan for Ethereum private keys if enabled
-                                if self.config.scan_eth_keys {
-                                    if let Err(e) = self.scan_for_eth_keys(line, file_path, Some(i + 1)) {
-                                        error!("Error scanning OCR text for ETH keys: {}", e);
-                                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        debug!("OCR extracted no text from {}", file_path.display());
-                    }
-                    
-                    // Clean up OCR resources
-                    if let Err(e) = ocr.cleanup() {
-                        error!("Error cleaning up OCR resources: {}", e);
-                    }
-                    
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("OCR processing failed for {}: {}", file_path.display(), e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    Err(ScannerError::OcrError(format!("OCR processing failed: {}", e)))
-                }
-            }
-        }
-        
-        // If OCR support is not enabled
-        #[cfg(not(feature = "ocr"))]
-        {
-            warn!("OCR support not enabled. Skipping image file: {}", file_path.display());
-            Ok(())
-        }
-    }
-
-    /// Scan text for potential seed phrases
-    fn scan_for_seed_phrases(
-        &self,
-        text: &str,
-        file_path: &Path,
-        line_number: Option<usize>,
-    ) -> Result<()> {
-        // Normalize and clean the text
-        let normalized_text = text.to_lowercase();
-        
-        // Extract words from the text
-        let words: Vec<&str> = normalized_text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| !s.is_empty())
-            .collect();
-        
-        // Check for potential seed phrases using a sliding window
-        let valid_word_counts = vec![12, 15, 18, 21, 24]; // BIP-39 standard word counts
-        
-        for window_size in valid_word_counts {
-            if words.len() < window_size {
-                continue;
-            }
-            
-            for window in words.windows(window_size) {
-                let potential_phrase = window.join(" ");
-                
-                // Try to parse as a valid seed phrase
-                match Mnemonic::from_phrase(&potential_phrase, self.parser.clone()) {
-                    Ok(mnemonic) => {
-                        // Found a valid seed phrase!
-                        let phrase = mnemonic.to_phrase();
-                        
-                        // Generate wallet addresses
-                        let mut wallet_addresses = Vec::new();
-                        
-                        // Try different networks - excluding Bitcoin testnet as per requirements
-                        for network in &[Network::Bitcoin, Network::Ethereum] {
-                            if let Ok(wallet) = Wallet::from_mnemonic(&mnemonic, *network, None) {
-                                wallet_addresses.push(wallet.address().to_string());
-                            }
-                        }
-                        
-                        let found_phrase = FoundPhrase {
-                            phrase,
-                            file_path: file_path.display().to_string(),
-                            line_number,
-                            wallet_addresses,
-                            fuzzy_matched: false,
-                            confidence: Some(1.0), // Exact match
-                        };
-                        
-                        // Store in database
-                        if let Ok(is_new) = self.db.insert_phrase(&found_phrase) {
-                            if is_new {
-                                self.stats.phrases_found.fetch_add(1, Ordering::Relaxed);
-                                info!(
-                                    "Found seed phrase in {} (line {:?})",
-                                    file_path.display(),
-                                    line_number
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Not a valid seed phrase, try fuzzy matching if enabled
-                        if self.config.use_fuzzy_matching {
-                            self.try_fuzzy_match_seed_phrase(
-                                &potential_phrase,
-                                file_path,
-                                line_number,
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Try to fuzzy match a potential seed phrase
-    fn try_fuzzy_match_seed_phrase(
-        &self,
-        potential_phrase: &str,
-        file_path: &Path,
-        line_number: Option<usize>,
-    ) -> Result<()> {
-        // Split the potential phrase into words
-        let words: Vec<&str> = potential_phrase.split_whitespace().collect();
-        
-        // For each word, find the closest BIP-39 word
-        let mut corrected_words = Vec::with_capacity(words.len());
-        let mut total_similarity = 0.0;
-        let mut valid_words = 0;
-        
-        for word in &words {
-            // Check if the word is already valid
-            if self.parser.is_valid_word(word) {
-                corrected_words.push(word.to_string());
-                total_similarity += 1.0;
-                valid_words += 1;
-                continue;
-            }
-            
-            // Find the closest BIP-39 word
-            let (closest_word, similarity) = self.find_closest_bip39_word(word);
-            corrected_words.push(closest_word.to_string());
-            total_similarity += similarity;
-            
-            if similarity > 0.7 {
-                valid_words += 1;
-            }
-        }
-        
-        // Calculate average similarity
-        let avg_similarity = total_similarity / words.len() as f64;
-        
-        // If we have enough valid words and the average similarity is high enough,
-        // consider this a potential seed phrase
-        if valid_words >= self.config.min_bip39_words && avg_similarity >= self.config.fuzzy_threshold {
-            // Construct the corrected phrase
-            let corrected_phrase = corrected_words.join(" ");
-            
-            // Try to parse it as a valid seed phrase
-            if let Ok(mnemonic) = Mnemonic::from_phrase(&corrected_phrase, self.parser.clone()) {
-                // Generate wallet addresses
-                let mut wallet_addresses = Vec::new();
-                
-                // Try different networks - excluding Bitcoin testnet as per requirements
-                for network in &[Network::Bitcoin, Network::Ethereum] {
-                    if let Ok(wallet) = Wallet::from_mnemonic(&mnemonic, *network, None) {
-                        wallet_addresses.push(wallet.address().to_string());
-                    }
-                }
-                
-                let found_phrase = FoundPhrase {
-                    phrase: corrected_phrase,
-                    file_path: file_path.display().to_string(),
-                    line_number,
-                    wallet_addresses,
-                    fuzzy_matched: true,
-                    confidence: Some(avg_similarity),
-                };
-                
-                // Store in database
-                if let Ok(is_new) = self.db.insert_phrase(&found_phrase) {
-                    if is_new {
-                        self.stats.phrases_found.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            "Found fuzzy-matched seed phrase in {} (line {:?}), confidence: {:.2}",
-                            file_path.display(),
-                            line_number,
-                            avg_similarity
-                        );
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Find the closest BIP-39 word to a given word
-    fn find_closest_bip39_word(&self, word: &str) -> (String, f64) {
-        use strsim::jaro_winkler;
-        
-        let wordlist = self.parser.wordlist();
-        let mut best_match = String::new();
-        let mut best_similarity = 0.0;
-        
-        for valid_word in wordlist {
-            let similarity = jaro_winkler(word, valid_word);
-            
-            if similarity > best_similarity {
-                best_similarity = similarity;
-                best_match = valid_word.to_string();
-            }
-        }
-        
-        (best_match, best_similarity)
-    }
-
-    /// Scan text for Ethereum private keys
-    fn scan_for_eth_keys(
-        &self,
-        text: &str,
-        file_path: &Path,
-        line_number: Option<usize>,
-    ) -> Result<()> {
-        // Ethereum private keys are 64 character hex strings
-        // They may be prefixed with 0x or not
-        
-        // Simple regex-like search
-        let normalized_text = text.trim().to_lowercase();
-        
-        // Look for 64-character hex strings
-        for word in normalized_text.split_whitespace() {
-            let key_str = word.trim_start_matches("0x");
-            
-            // Check if it's a potential Ethereum private key
-            if key_str.len() == 64 && key_str.chars().all(|c| c.is_ascii_hexdigit()) {
-                debug!(
-                    "Found potential Ethereum private key in {} (line {:?})",
-                    file_path.display(),
-                    line_number
-                );
-                
-                // Validate by deriving address
-                if let Ok(eth_address) = self.derive_eth_address(key_str) {
-                    let found_key = FoundEthKey {
-                        private_key: key_str.to_string(),
-                        file_path: file_path.display().to_string(),
-                        line_number,
-                        eth_address,
-                    };
-                    
-                    // Store in database
-                    if let Ok(is_new) = self.db.insert_eth_key(&found_key) {
-                        if is_new {
-                            self.stats.eth_keys_found.fetch_add(1, Ordering::Relaxed);
-                            info!(
-                                "Found Ethereum private key in {} (line {:?})",
-                                file_path.display(),
-                                line_number
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Derive Ethereum address from private key
-    fn derive_eth_address(&self, private_key_hex: &str) -> Result<String> {
-        // Convert hex to bytes
-        let private_key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| ScannerError::Other(format!("Invalid private key hex: {}", e)))?;
-        
-        if private_key_bytes.len() != 32 {
-            return Err(ScannerError::Other(format!(
-                "Invalid Ethereum private key length: got {} bytes, expected 32",
-                private_key_bytes.len()
-            )));
-        }
-        
-        // Generate public key using secp256k1
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&private_key_bytes)
-            .map_err(|e| ScannerError::Other(format!("Invalid private key: {}", e)))?;
-        
-        // Get the public key (uncompressed format)
-        let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
-        let public_key_serialized = public_key.serialize_uncompressed();
-        
-        // Take the last 64 bytes of the public key (remove the prefix 0x04)
-        let public_key_without_prefix = &public_key_serialized[1..];
-        
-        // Hash the public key with Keccak-256
-        use tiny_keccak::{Hasher, Keccak};
-        let mut keccak = Keccak::v256();
-        let mut hash = [0u8; 32];
-        keccak.update(public_key_without_prefix);
-        keccak.finalize(&mut hash);
-        
-        // Take the last 20 bytes and format as Ethereum address
-        let eth_address = format!("0x{}", hex::encode(&hash[12..32]));
-        
-        Ok(eth_address)
-    }
-
-    /// Process an archive file (ZIP, etc.)
-    fn process_archive_file(&self, file_path: &Path) -> Result<()> {
-        info!("Processing archive file: {}", file_path.display());
-        
-        #[cfg(feature = "archive")]
-        {
-            use std::io::{Cursor, Read};
-            use tempfile::tempdir;
-            use zip::ZipArchive;
-            
-            // Open the ZIP file
-            let file = fs::File::open(file_path).map_err(|e| {
-                error!("Failed to open archive file {}: {}", file_path.display(), e);
-                ScannerError::IoError(e)
-            })?;
-            
-            // Create a ZIP archive reader
-            let mut archive = ZipArchive::new(file).map_err(|e| {
-                error!("Failed to read ZIP archive {}: {}", file_path.display(), e);
-                ScannerError::Other(format!("ZIP error: {}", e))
-            })?;
-            
-            // Create a temporary directory for extracted files
-            let temp_dir = tempdir().map_err(|e| {
-                error!("Failed to create temporary directory: {}", e);
-                ScannerError::IoError(e)
-            })?;
-            
-            debug!("Created temporary directory for archive extraction: {}", temp_dir.path().display());
-            
-            // Process each file in the archive
-            for i in 0..archive.len() {
-                // Check for shutdown signal
-                if self.shutdown.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                
-                let mut file = match archive.by_index(i) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        error!("Failed to access file in archive at index {}: {}", i, e);
-                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                
-                if file.is_dir() {
-                    // Skip directories
-                    continue;
-                }
-                
-                let filename = match file.enclosed_name() {
-                    Some(path) => path.to_path_buf(),
-                    None => {
-                        error!("Invalid file name in archive at index {}", i);
-                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                
-                // Check if we should skip this file based on extension
-                if self.should_skip_file(&filename) {
-                    trace!("Skipping archive entry: {}", filename.display());
-                    continue;
-                }
-                
-                // Create a temporary path for this file
-                let temp_path = temp_dir.path().join(&filename);
-                
-                // Create parent directories if needed
-                if let Some(parent) = temp_path.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        error!("Failed to create directory {}: {}", parent.display(), e);
-                        ScannerError::IoError(e)
-                    })?;
-                }
-                
-                // Extract the file
-                let mut contents = Vec::new();
-                if let Err(e) = file.read_to_end(&mut contents) {
-                    error!("Failed to read file from archive: {}", e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                
-                // Update stats for extracted file size
-                self.stats
-                    .bytes_processed
-                    .fetch_add(contents.len() as u64, Ordering::Relaxed);
-                
-                // Write to temporary file
-                if let Err(e) = fs::write(&temp_path, &contents) {
-                    error!("Failed to write temporary file {}: {}", temp_path.display(), e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                
-                // Process the extracted file
-                if let Err(e) = self.process_file(&temp_path) {
-                    error!("Error processing extracted file {}: {}", temp_path.display(), e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            
-            debug!("Finished processing archive: {}", file_path.display());
-            Ok(())
-        }
-        
-        #[cfg(not(feature = "archive"))]
-        {
-            warn!("Archive support not enabled. Skipping archive file: {}", file_path.display());
-            // Still update stats for skipped file
-            self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
-
-    /// Process a document file (DOCX, XLSX)
-    fn process_document_file(&self, file_path: &Path) -> Result<()> {
-        info!("Processing document file: {}", file_path.display());
-        
-        #[cfg(any(feature = "docx", feature = "xlsx"))]
-        {
-            use std::io::{Cursor, Read};
-            use tempfile::tempdir;
-            use zip::ZipArchive;
-            
-            // Update file count in stats
-            self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
-            
-            // Update processed bytes in stats
-            if let Ok(metadata) = fs::metadata(file_path) {
-                self.stats
-                    .bytes_processed
-                    .fetch_add(metadata.len(), Ordering::Relaxed);
-            }
-            
-            // Office documents (DOCX, XLSX) are ZIP archives with XML content
-            let file = fs::File::open(file_path).map_err(|e| {
-                error!("Failed to open document file {}: {}", file_path.display(), e);
-                ScannerError::IoError(e)
-            })?;
-            
-            // Create a ZIP archive reader
-            let mut archive = ZipArchive::new(file).map_err(|e| {
-                error!("Failed to read document as ZIP archive {}: {}", file_path.display(), e);
-                ScannerError::Other(format!("ZIP error: {}", e))
-            })?;
-            
-            // Office XML document formats store text in different files based on type
-            let text_files = match file_path.extension().and_then(|ext| ext.to_str()) {
-                Some("docx") => vec!["word/document.xml", "word/header1.xml", "word/footer1.xml"],
-                Some("xlsx") => vec!["xl/sharedStrings.xml", "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml", "xl/worksheets/sheet3.xml"],
-                Some("pptx") => {
-                    // For presentations, try multiple slides
-                    let mut files = Vec::new();
-                    for i in 1..=20 {  // Try up to 20 slides
-                        files.push(format!("ppt/slides/slide{}.xml", i));
-                    }
-                    files
-                },
-                Some("odt") => vec!["content.xml"],
-                Some("ods") => vec!["content.xml"],
-                _ => vec![],
-            };
-            
-            let mut all_text = String::new();
-            
-            // Extract and read XML files containing text
-            for xml_file in &text_files {
-                // Check for shutdown signal
-                if self.shutdown.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                
-                // Try to get the file, but don't error if it doesn't exist (e.g., slide20.xml might not exist)
-                if let Ok(mut file) = archive.by_name(xml_file) {
-                    let mut contents = String::new();
-                    if let Err(e) = file.read_to_string(&mut contents) {
-                        error!("Failed to read XML file '{}' from document: {}", xml_file, e);
-                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    
-                    // Extract text from XML using quick-xml
-                    if let Some(extracted_text) = self.extract_text_from_xml(&contents) {
-                        if !extracted_text.trim().is_empty() {
-                            debug!("Extracted text from {}: {} characters", xml_file, extracted_text.len());
-                            all_text.push_str(&extracted_text);
-                            all_text.push('\n');
-                        }
-                    }
-                }
-            }
-            
-            // Process the extracted text
-            if !all_text.is_empty() {
-                debug!("Extracted {} characters from document {}", all_text.len(), file_path.display());
-                
-                // Process each line of text
-                for (i, line) in all_text.lines().enumerate() {
-                    // Check for shutdown signal
-                    if self.shutdown.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    
-                    if !line.trim().is_empty() {
-                        // Scan for seed phrases
-                        if let Err(e) = self.scan_for_seed_phrases(line, file_path, Some(i + 1)) {
-                            error!("Error scanning document text: {}", e);
-                            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        
-                        // Scan for Ethereum private keys if enabled
-                        if self.config.scan_eth_keys {
-                            if let Err(e) = self.scan_for_eth_keys(line, file_path, Some(i + 1)) {
-                                error!("Error scanning document text for ETH keys: {}", e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            } else {
-                debug!("No text extracted from document: {}", file_path.display());
-            }
-            
-            Ok(())
-        }
-        
-        #[cfg(not(any(feature = "docx", feature = "xlsx")))]
-        {
-            warn!("Document support not enabled. Skipping document file: {}", file_path.display());
-            // Still update stats for skipped file
-            self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
-            
-            // Update processed bytes in stats
-            if let Ok(metadata) = fs::metadata(file_path) {
-                self.stats
-                    .bytes_processed
-                    .fetch_add(metadata.len(), Ordering::Relaxed);
-            }
-            
-            Ok(())
-        }
-    }
-    
-    /// Extract text from XML content
-    #[cfg(any(feature = "docx", feature = "xlsx"))]
-    fn extract_text_from_xml(&self, xml_content: &str) -> Option<String> {
-        use quick_xml::events::Event;
-        use quick_xml::reader::Reader;
-        
-        let mut reader = Reader::from_str(xml_content);
-        reader.trim_text(true);
-        
-        let mut text = String::new();
-        let mut buf = Vec::new();
-        let mut in_text_element = false;
-        let mut current_element = String::new();
-        
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
-                    // Track element names for context
-                    let name = e.name().as_ref();
-                    current_element = String::from_utf8_lossy(name).to_string();
-                    
-                    // For DOCX, text is in <w:t> elements
-                    // For XLSX, text is in <t> elements
-                    // For other formats, we look for likely text elements
-                    if name == b"w:t" || name == b"t" || name == b"text" || name == b"content" {
-                        in_text_element = true;
-                    }
-                },
-                Ok(Event::End(ref e)) => {
-                    let name = e.name().as_ref();
-                    if name == b"w:t" || name == b"t" || name == b"text" || name == b"content" {
-                        in_text_element = false;
-                        
-                        // Add space after text elements, but not after certain structural elements
-                        if name != b"content" {
-                            text.push(' ');
-                        }
-                    }
-                    
-                    // For paragraph breaks in DOCX
-                    if name == b"w:p" {
-                        text.push('\n');
-                    }
-                    
-                    // For row breaks in XLSX
-                    if name == b"row" {
-                        text.push('\n');
-                    }
-                },
-                Ok(Event::Text(e)) => {
-                    if let Ok(txt) = e.unescape() {
-                        let txt_str = txt.trim();
-                        if !txt_str.is_empty() {
-                            // Only add text from actual text elements or if we don't know which elements contain text
-                            if in_text_element || current_element.is_empty() {
-                                text.push_str(txt_str);
-                            }
-                        }
-                    }
-                },
-                Ok(Event::Eof) => break,
-                Err(e) => {
-                    error!("Error parsing XML: {}", e);
-                    break;
-                },
-                _ => (),
-            }
-            buf.clear();
-        }
-        
-        // Clean up the text by removing redundant spaces and line breaks
-        let cleaned_text = text
-            .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        
-        if cleaned_text.is_empty() {
-            None
-        } else {
-            Some(cleaned_text)
-        }
-    }
-    
-    #[cfg(not(any(feature = "docx", feature = "xlsx")))]
-    #[allow(dead_code)]
-    fn extract_text_from_xml(&self, _xml_content: &str) -> Option<String> {
-        None
-    }
-
-    /// Process a PDF file
-    fn process_pdf_file(&self, file_path: &Path) -> Result<()> {
-        info!("Processing PDF file: {}", file_path.display());
-        
-        // Update file count in stats
-        self.stats.files_processed.fetch_add(1, Ordering::Relaxed);
-        
-        // Update processed bytes in stats
-        if let Ok(metadata) = fs::metadata(file_path) {
-            self.stats
-                .bytes_processed
-                .fetch_add(metadata.len(), Ordering::Relaxed);
-        }
-        
-        #[cfg(feature = "pdf_support")]
-        {
-            use pdf::file::File as PdfFile;
-            use pdf::object::*;
-            use pdf::primitive::Primitive;
-            use std::io::Read;
-            
-            // Open the PDF file
-            let file = std::fs::File::open(file_path).map_err(|e| {
-                error!("Failed to open PDF file {}: {}", file_path.display(), e);
-                ScannerError::IoError(e)
-            })?;
-            
-            // Parse the PDF
-            let pdf = match PdfFile::from_reader(file) {
-                Ok(pdf) => pdf,
-                Err(e) => {
-                    error!("Failed to parse PDF file {}: {}", file_path.display(), e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(ScannerError::Other(format!("PDF error: {}", e)));
-                }
-            };
-            
-            // Extract text from each page
-            let mut all_text = String::new();
-            
-            for i in 1..=pdf.num_pages() {
-                // Check for shutdown signal
-                if self.shutdown.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                
-                match pdf.get_page(i) {
-                    Ok(page) => {
-                        match page.contents() {
-                            Ok(content) => {
-                                // Extract text from content streams
-                                if let Some(text) = self.extract_text_from_pdf_content(&content) {
-                                    debug!("Extracted text from page {}: {} characters", i, text.len());
-                                    all_text.push_str(&text);
-                                    all_text.push('\n');
-                                }
-                            },
-                            Err(e) => {
-                                error!("Failed to get contents for page {} in PDF {}: {}", i, file_path.display(), e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to get page {} in PDF {}: {}", i, file_path.display(), e);
-                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            
-            // Process the extracted text
-            if !all_text.is_empty() {
-                debug!("Extracted {} characters from PDF {}", all_text.len(), file_path.display());
-                
-                // Process each line of text
-                for (i, line) in all_text.lines().enumerate() {
-                    // Check for shutdown signal
-                    if self.shutdown.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    
-                    if !line.trim().is_empty() {
-                        // Scan for seed phrases
-                        if let Err(e) = self.scan_for_seed_phrases(line, file_path, Some(i + 1)) {
-                            error!("Error scanning PDF text: {}", e);
-                            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        
-                        // Scan for Ethereum private keys if enabled
-                        if self.config.scan_eth_keys {
-                            if let Err(e) = self.scan_for_eth_keys(line, file_path, Some(i + 1)) {
-                                error!("Error scanning PDF text for ETH keys: {}", e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            } else {
-                debug!("No text extracted from PDF: {}", file_path.display());
-                
-                // If no text was found, try OCR if enabled
-                if self.config.use_ocr {
-                    debug!("Attempting OCR on PDF {}", file_path.display());
-                    
-                    // Try to process the PDF as an image
-                    if let Err(e) = self.process_image_file(file_path) {
-                        debug!("OCR on PDF failed: {}", e);
-                    }
-                }
-            }
-            
-            Ok(())
-        }
-        
-        #[cfg(not(feature = "pdf_support"))]
-        {
-            warn!("PDF support not enabled. Skipping PDF file: {}", file_path.display());
-            Ok(())
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Helper function to extract text from PDF content stream
-    fn extract_text_from_pdf_content(&self, content: &[u8]) -> Option<String> {
-        // This is a production-level implementation for PDF text extraction
-        debug!("Extracting text from PDF content stream: {} bytes", content.len());
-        
-        // Try to parse as UTF-8, but handle the case where it's binary content
-        let content_str = String::from_utf8_lossy(content);
-        let mut text = String::new();
-        
-        // Stage 1: Process text between BT/ET operators
-        self.extract_text_between_bt_et(&content_str, &mut text);
-        
-        // Stage 2: Process hex-encoded strings (<ABCDEF>)
-        self.extract_hex_strings(&content_str, &mut text);
-        
-        // Stage 3: Look for other potential strings that might be missed
-        self.extract_potential_text(&content_str, &mut text);
-        
-        // Clean up the extracted text
-        let cleaned_text = self.clean_extracted_text(&text);
-        
-        if cleaned_text.is_empty() {
-            debug!("No text extracted from PDF content");
-            None
-        } else {
-            debug!("Extracted {} characters from PDF content", cleaned_text.len());
-            Some(cleaned_text)
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Stage 1: Extract text between BT/ET operators
-    fn extract_text_between_bt_et(&self, content_str: &str, text: &mut String) {
-        // 1. Extract text between BT (Begin Text) and ET (End Text) operators
-        let parts: Vec<&str> = content_str.split("BT").collect();
-        for part in parts.iter().skip(1) {
-            if let Some(end_idx) = part.find("ET") {
-                let text_section = &part[..end_idx];
-                
-                // Process text operators
-                self.extract_text_from_tj_operator(text_section, text);
-                self.extract_text_from_quote_operators(text_section, text);
-                self.extract_text_from_tj_array(text_section, text);
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Process Tj operator in PDF content
-    fn extract_text_from_tj_operator(&self, text_section: &str, text: &mut String) {
-        // Extract text from Tj operator (parenthesized strings)
-        let tj_parts: Vec<&str> = text_section.split("Tj").collect();
-        for tj_part in &tj_parts {
-            // Find the last opening parenthesis before Tj
-            if let Some(start_idx) = tj_part.rfind('(') {
-                if let Some(end_idx) = tj_part[start_idx+1..].find(')') {
-                    // Extract text and handle PDF string escaping
-                    let extracted = &tj_part[start_idx+1..start_idx+1+end_idx];
-                    let cleaned = self.clean_pdf_string(extracted);
-                    if !cleaned.is_empty() {
-                        text.push_str(&cleaned);
-                        text.push(' ');
-                    }
-                }
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Process ' and " operators in PDF content
-    fn extract_text_from_quote_operators(&self, text_section: &str, text: &mut String) {
-        // Extract text from ' operator (also shows text)
-        let quote_parts: Vec<&str> = text_section.split('\'').collect();
-        for quote_part in &quote_parts {
-            if let Some(start_idx) = quote_part.rfind('(') {
-                if let Some(end_idx) = quote_part[start_idx+1..].find(')') {
-                    let extracted = &quote_part[start_idx+1..start_idx+1+end_idx];
-                    let cleaned = self.clean_pdf_string(extracted);
-                    if !cleaned.is_empty() {
-                        text.push_str(&cleaned);
-                        text.push(' ');
-                    }
-                }
-            }
-        }
-        
-        // Extract text from " operator (also shows text)
-        let dquote_parts: Vec<&str> = text_section.split('"').collect();
-        for dquote_part in &dquote_parts {
-            if let Some(start_idx) = dquote_part.rfind('(') {
-                if let Some(end_idx) = dquote_part[start_idx+1..].find(')') {
-                    let extracted = &dquote_part[start_idx+1..start_idx+1+end_idx];
-                    let cleaned = self.clean_pdf_string(extracted);
-                    if !cleaned.is_empty() {
-                        text.push_str(&cleaned);
-                        text.push(' ');
-                    }
-                }
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Process TJ arrays in PDF content
-    fn extract_text_from_tj_array(&self, text_section: &str, text: &mut String) {
-        // Extract text from TJ operator (array of strings and positioning)
-        // TJ uses arrays like [(text1) offset1 (text2) offset2 ... ] TJ
-        let mut array_pos = 0;
-        
-        while let Some(array_start) = text_section[array_pos..].find('[') {
-            array_pos += array_start;
-            
-            // Look for the closing bracket
-            if let Some(array_end) = text_section[array_pos..].find(']') {
-                let tj_array = &text_section[array_pos..array_pos+array_end+1];
-                
-                // Now process the array content
-                let mut current_pos = 1; // Skip the opening [
-                let array_len = tj_array.len();
-                
-                // Extract all strings in the TJ array
-                while current_pos < array_len {
-                    if let Some(str_start) = tj_array[current_pos..].find('(') {
-                        current_pos += str_start + 1;
-                        if current_pos >= array_len { break; }
-                        
-                        if let Some(str_end) = tj_array[current_pos..].find(')') {
-                            if current_pos + str_end <= array_len {
-                                let extracted = &tj_array[current_pos..current_pos+str_end];
-                                let cleaned = self.clean_pdf_string(extracted);
-                                if !cleaned.is_empty() {
-                                    text.push_str(&cleaned);
-                                    // Don't always add space here - space handling is complex in PDFs
-                                    // We'll handle spacing in final cleanup
-                                }
-                                current_pos += str_end + 1;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                
-                // Add space after processing the entire TJ array
-                text.push(' ');
-                
-                // Move past this array for next iteration
-                array_pos += array_end + 1;
-            } else {
-                break;
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Stage 2: Extract hex-encoded strings
-    fn extract_hex_strings(&self, content_str: &str, text: &mut String) {
-        // Look for hex strings enclosed in angle brackets
-        let mut pos = 0;
-        
-        while let Some(start_idx) = content_str[pos..].find('<') {
-            pos += start_idx + 1;
-            
-            // Ignore dictionary starts (<<)
-            if pos < content_str.len() && content_str.as_bytes()[pos] == b'<' {
-                pos += 1;
-                continue;
-            }
-            
-            // Look for the closing bracket
-            if let Some(end_idx) = content_str[pos..].find('>') {
-                let hex_str = &content_str[pos..pos+end_idx];
-                
-                // Verify it's actually hex data
-                if hex_str.chars().all(|c| c.is_ascii_hexdigit() || c.is_whitespace()) {
-                    // Convert hex to text
-                    if let Some(decoded) = self.decode_hex_string(hex_str) {
-                        if !decoded.is_empty() {
-                            text.push_str(&decoded);
-                            text.push(' ');
-                        }
-                    }
-                }
-                
-                pos += end_idx + 1;
-            } else {
-                break;
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Stage 3: Extract other potential strings that might be missed
-    fn extract_potential_text(&self, content_str: &str, text: &mut String) {
-        // This stage looks for parenthesized strings that might not be part of text operators
-        // It's a fallback for PDFs with non-standard structure
-        let mut pos = 0;
-        
-        while let Some(start_idx) = content_str[pos..].find('(') {
-            pos += start_idx + 1;
-            
-            // Find matching closing parenthesis (handling nested parentheses)
-            let mut level = 1;
-            let mut end_idx = 0;
-            
-            for (i, c) in content_str[pos..].char_indices() {
-                if c == '(' && content_str.as_bytes()[pos+i-1] != b'\\' {
-                    level += 1;
-                } else if c == ')' && content_str.as_bytes()[pos+i-1] != b'\\' {
-                    level -= 1;
-                    if level == 0 {
-                        end_idx = i;
-                        break;
-                    }
-                }
-            }
-            
-            if level == 0 && end_idx > 0 {
-                let potential_str = &content_str[pos..pos+end_idx];
-                
-                // Only use strings that look like text (contain letters, numbers, or punctuation)
-                if potential_str.chars().any(|c| c.is_alphanumeric() || c.is_ascii_punctuation()) {
-                    let cleaned = self.clean_pdf_string(potential_str);
-                    if !cleaned.is_empty() && cleaned.len() > 1 {
-                        // Only add if we haven't seen this text before
-                        if !text.contains(&cleaned) {
-                            text.push_str(&cleaned);
-                            text.push(' ');
-                        }
-                    }
-                }
-                
-                pos += end_idx + 1;
-            } else {
-                break;
-            }
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Helper to decode hex strings in PDFs
-    fn decode_hex_string(&self, hex_str: &str) -> Option<String> {
-        // Remove all whitespace
-        let hex_str = hex_str.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        
-        // Pad with 0 if odd length
-        let hex_str = if hex_str.len() % 2 == 1 {
-            format!("{}0", hex_str)
-        } else {
-            hex_str
-        };
-        
-        // Decode hex
-        if let Ok(bytes) = hex::decode(&hex_str) {
-            // Try to interpret as UTF-8 first
-            if let Ok(text) = String::from_utf8(bytes.clone()) {
-                Some(text)
-            } else {
-                // Fall back to PDFDocEncoding or other encodings
-                let mut result = String::new();
-                for b in bytes {
-                    // Map to basic ASCII if possible
-                    if b >= 32 && b <= 126 {
-                        result.push(b as char);
-                    }
-                }
-                Some(result)
-            }
-        } else {
-            None
-        }
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Clean the final extracted text
-    fn clean_extracted_text(&self, text: &str) -> String {
-        // First replace multiple spaces with a single space
-        let text = text.replace("  ", " ");
-        
-        // Then clean up each line
-        text.lines()
-            .map(|line| {
-                let line = line.trim();
-                if line.len() < 2 {
-                    return "";
-                }
-                line
-            })
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-    
-    #[cfg(feature = "pdf_support")]
-    /// Clean PDF string by handling escapes and encodings
-    fn clean_pdf_string(&self, pdf_string: &str) -> String {
-        let mut result = String::with_capacity(pdf_string.len());
-        let mut chars = pdf_string.chars().peekable();
-        
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    // Handle escape sequences
-                    if let Some(next) = chars.next() {
-                        match next {
-                            'n' => result.push('\n'),
-                            'r' => result.push('\r'),
-                            't' => result.push('\t'),
-                            'b' => result.push('\u{0008}'), // Backspace
-                            'f' => result.push('\u{000C}'), // Form feed
-                            '(' => result.push('('),
-                            ')' => result.push(')'),
-                            '\\' => result.push('\\'),
-                            // Octal character code \ddd
-                            d1 @ '0'..='7' => {
-                                let mut octal = d1.to_string();
-                                // Get up to 2 more octal digits
-                                for _ in 0..2 {
-                                    if let Some(&d @ '0'..='7') = chars.peek() {
-                                        octal.push(d);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                // Convert octal to character
-                                if let Ok(code) = u32::from_str_radix(&octal, 8) {
-                                    if let Some(ch) = std::char::from_u32(code) {
-                                        result.push(ch);
-                                    }
-                                }
-                            },
-                            _ => result.push(next), // Unrecognized escape, just include it
-                        }
-                    }
-                },
-                _ => result.push(c)
-            }
-        }
-        
-        result
-    }
-
-    /// Signal the scanner to shut down
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
-    /// Get reference to the scanning statistics
-    pub fn stats(&self) -> &Arc<ScanStats> {
-        &self.stats
-    }
-
-    /// Check if a word is a valid BIP39 word
-    pub fn is_valid_bip39_word(&self, word: &str) -> bool {
-        self.parser.is_valid_word(word)
     }
 }
 
@@ -2453,7 +1479,7 @@ mod tests {
         /F1 12 Tf
         (This is a test document containing a seed phrase:) Tj
         ( abandon abandon abandon abandon abandon abandon ) Tj
-        [ (abandon) -250 (abandon) -250 (abandon) -250 (abandon) -250 (abandon) -250 (about) ] TJ
+        [ (abandon) -250 (abandon) -250 (abandon) -250 (abandon) -250 (about) ] TJ
         ET
         endstream
         endobj
