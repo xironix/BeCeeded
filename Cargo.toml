@@ -60,7 +60,7 @@ ahash = "0.8.11"                # Fast, cross-platform hashing functions
 twox-hash = "1.6.3"             # Another fast hashing implementation
 
 # Document format support
-zip = { version = "2.2.3", optional = true }      # ZIP file processing
+zip = { version = "2.3.0", optional = true }      # ZIP file processing
 pdf = { version = "0.9.0", optional = true }      # PDF parsing
 quick-xml = { version = "0.37.2", optional = true } # For DOCX/XLSX parsing
 tempfile = "3.17.1"                              # Needed for temp files when extracting
