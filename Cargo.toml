@@ -9,7 +9,7 @@ license = "MIT"
 
 [dependencies]
 # Core functionality
-ring = "0.17.11"                # Cryptographic operations (replacement for OpenSSL)
+ring = "0.17.13"                # Cryptographic operations (replacement for OpenSSL)
 thiserror = "2.0.11"           # Error handling - latest version
 log = "0.4.26"                 # Logging interface
 env_logger = "0.11.6"          # Logging implementation
