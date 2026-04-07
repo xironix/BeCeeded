@@ -16,7 +16,7 @@ env_logger = "0.11.6"          # Logging implementation
 rayon = "1.10.0"                # Parallel processing (replacement for thread_pool)
 crossbeam = "0.8.4"            # Work-stealing queue and thread coordination 
 crossbeam-utils = "0.8.19"     # Utilities for crossbeam
-crossbeam-channel = "0.5.11"   # Multi-producer multi-consumer channels
+crossbeam-channel = "0.5.15"   # Multi-producer multi-consumer channels
 crossbeam-deque = "0.8.4"      # Work-stealing deque
 serde = { version = "1.0.218", features = ["derive"] } # Serialization/deserialization
 serde_json = "1.0.139"         # JSON support
